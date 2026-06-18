@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qwen MemoryAgent</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #0f0f13;
+    color: #e8e8f0;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 20px;
+    background: #16161e;
+    border-bottom: 1px solid #2a2a3a;
+    flex-shrink: 0;
+  }
+  header h1 {
+    font-size: 17px;
+    font-weight: 600;
+    color: #a78bfa;
+    letter-spacing: 0.3px;
+  }
+  header span {
+    font-size: 12px;
+    color: #6b6b8a;
+    margin-left: auto;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #34d399; flex-shrink: 0; }
+  .dot.offline { background: #f87171; }
+  .user-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 20px;
+    background: #12121a;
+    border-bottom: 1px solid #1e1e2e;
+    flex-shrink: 0;
+  }
+  .user-bar label { font-size: 12px; color: #6b6b8a; }
+  .user-bar input {
+    background: #1e1e2e;
+    border: 1px solid #2a2a3a;
+    border-radius: 6px;
+    padding: 5px 10px;
+    color: #e8e8f0;
+    font-size: 13px;
+    width: 180px;
+  }
+  .user-bar input:focus { outline: none; border-color: #7c3aed; }
+  .session-id { font-size: 11px; color: #444466; margin-left: auto; }
+  .main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+  .chat-panel {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+    border-right: 1px solid #1e1e2e;
+  }
+  .messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .message {
+    display: flex;
+    flex-direction: column;
+    max-width: 80%;
+  }
+  .message.user { align-self: flex-end; align-items: flex-end; }
+  .message.assistant { align-self: flex-start; align-items: flex-start; }
+  .bubble {
+    padding: 10px 14px;
+    border-radius: 12px;
+    font-size: 14px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+  }
+  .user .bubble {
+    background: #7c3aed;
+    color: #fff;
+    border-bottom-right-radius: 4px;
+  }
+  .assistant .bubble {
+    background: #1e1e2e;
+    color: #d4d4e8;
+    border-bottom-left-radius: 4px;
+    border: 1px solid #2a2a3a;
+  }
+  .meta {
+    font-size: 11px;
+    color: #444466;
+    margin-top: 4px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .memory-badge {
+    background: #1a1a2e;
+    border: 1px solid #4c1d95;
+    color: #a78bfa;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 10px;
+  }
+  .memory-badge.stored { border-color: #065f46; color: #34d399; }
+  .typing {
+    display: none;
+    align-self: flex-start;
+  }
+  .typing.visible { display: flex; }
+  .typing .bubble {
+    background: #1e1e2e;
+    border: 1px solid #2a2a3a;
+    color: #6b6b8a;
+    font-size: 13px;
+    font-style: italic;
+  }
+  .input-bar {
+    padding: 14px 20px;
+    background: #12121a;
+    border-top: 1px solid #1e1e2e;
+    display: flex;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+  .input-bar textarea {
+    flex: 1;
+    background: #1e1e2e;
+    border: 1px solid #2a2a3a;
+    border-radius: 8px;
+    padding: 10px 14px;
+    color: #e8e8f0;
+    font-size: 14px;
+    resize: none;
+    font-family: inherit;
+    line-height: 1.4;
+    max-height: 120px;
+    overflow-y: auto;
+  }
+  .input-bar textarea:focus { outline: none; border-color: #7c3aed; }
+  .input-bar textarea::placeholder { color: #3a3a55; }
+  .send-btn {
+    background: #7c3aed;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 18px;
+    color: #fff;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    align-self: flex-end;
+    transition: background 0.15s;
+  }
+  .send-btn:hover { background: #6d28d9; }
+  .send-btn:disabled { background: #2a2a3a; color: #444466; cursor: not-allowed; }
+  .memory-panel {
+    width: 320px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    background: #0c0c12;
+  }
+  .memory-header {
+    padding: 14px 16px;
+    border-bottom: 1px solid #1e1e2e;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+  }
+  .memory-header h2 {
+    font-size: 12px;
+    font-weight: 600;
+    color: #6b6b8a;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+  }
+  .refresh-btn {
+    background: none;
+    border: 1px solid #2a2a3a;
+    border-radius: 4px;
+    padding: 3px 8px;
+    color: #6b6b8a;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .refresh-btn:hover { color: #a78bfa; border-color: #4c1d95; }
+  .memory-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .memory-card {
+    background: #16161e;
+    border: 1px solid #1e1e2e;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 12px;
+    line-height: 1.5;
+    transition: border-color 0.15s;
+  }
+  .memory-card:hover { border-color: #2a2a3a; }
+  .memory-card.fresh { border-left: 2px solid #a78bfa; }
+  .memory-content { color: #c4c4d8; margin-bottom: 6px; white-space: pre-wrap; }
+  .memory-score-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .score-track {
+    flex: 1;
+    height: 3px;
+    background: #2a2a3a;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .score-fill {
+    height: 100%;
+    border-radius: 2px;
+    background: #7c3aed;
+    transition: width 0.3s;
+  }
+  .score-fill.high { background: #34d399; }
+  .score-fill.mid { background: #fbbf24; }
+  .score-fill.low { background: #f87171; }
+  .score-label { font-size: 10px; color: #444466; min-width: 28px; text-align: right; }
+  .memory-meta { font-size: 10px; color: #333355; margin-top: 4px; }
+  .empty-state {
+    text-align: center;
+    padding: 40px 16px;
+    color: #333355;
+    font-size: 12px;
+    line-height: 1.8;
+  }
+  .delete-btn {
+  background: none;
+  border: none;
+  color: #333355;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 4px;
+  float: right;
+  line-height: 1;
+}
+.delete-btn:hover { color: #f87171; }
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #2a2a3a; border-radius: 2px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="dot" id="statusDot"></div>
+  <h1>Qwen MemoryAgent</h1>
+  <span>Track 1 · Global AI Hackathon</span>
+</header>
+<div class="user-bar">
+  <label>User ID</label>
+  <input type="text" id="userId" placeholder="e.g. nidhi" value="nidhi" />
+  <button class="refresh-btn" onclick="newSession()">New Session</button>
+  <button class="refresh-btn" onclick="clearHistory()">Clear Chat</button>
+  <span class="session-id" id="sessionLabel">session: —</span>
+</div>
+<div class="main">
+  <div class="chat-panel">
+    <div class="messages" id="messages">
+      <div class="message assistant">
+        <div class="bubble">Hi! I'm your memory-enabled assistant. I'll remember what you tell me — even across sessions. What's on your mind?</div>
+      </div>
+    </div>
+    <div class="typing" id="typing">
+      <div class="bubble">thinking…</div>
+    </div>
+    <div class="input-bar">
+      <textarea id="input" rows="1" placeholder="Type a message… (Enter to send, Shift+Enter for newline)"></textarea>
+      <button class="send-btn" id="sendBtn" onclick="sendMessage()">Send</button>
+    </div>
+  </div>
+  
+  <div class="memory-panel">
+    <div class="memory-header">
+      <h2>Stored Memories</h2>
+      <div style="display:flex;gap:6px;">
+        <button class="refresh-btn" onclick="loadMemories()">↻ Refresh</button>
+        <button class="refresh-btn" style="color:#f87171;border-color:#4c1d2e;" onclick="clearAllMemories()">✕ Clear All</button>
+    </div>
+  </div>
+    <div class="memory-list" id="memoryList">
+      <div class="empty-state">No memories yet.<br>Start chatting to build memory.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+  let API_BASE = 'http://localhost:8001';
+  let sessionId = crypto.randomUUID();
+  let conversationHistory = [];
+  let lastStoredId = null;
+
+  document.getElementById('sessionLabel').textContent = `session: ${sessionId.slice(0, 8)}…`;
+
+  async function checkHealth() {
+    try {
+      const r = await fetch(`${API_BASE}/health`);
+      const dot = document.getElementById('statusDot');
+      dot.className = r.ok ? 'dot' : 'dot offline';
+    } catch {
+      document.getElementById('statusDot').className = 'dot offline';
+    }
+  }
+  checkHealth();
+
+  function newSession() {
+    sessionId = crypto.randomUUID();
+    document.getElementById('sessionLabel').textContent = `session: ${sessionId.slice(0, 8)}…`;
+    conversationHistory = [];
+    document.getElementById('messages').innerHTML = `
+      <div class="message assistant">
+        <div class="bubble">New session started. I still remember everything from before — try asking me something from our past conversation.</div>
+      </div>`;
+  }
+
+  function clearHistory() {
+    conversationHistory = [];
+    document.getElementById('messages').innerHTML = `
+      <div class="message assistant">
+        <div class="bubble">Chat history cleared. Memory is still intact.</div>
+      </div>`;
+  }
+
+  async function sendMessage() {
+    const input = document.getElementById('input');
+    const msg = input.value.trim();
+    if (!msg) return;
+
+    const userId = document.getElementById('userId').value.trim() || 'default_user';
+
+    appendMessage('user', msg);
+    input.value = '';
+    input.style.height = 'auto';
+    setLoading(true);
+
+    try {
+      const resp = await fetch(`${API_BASE}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_id: userId,
+          session_id: sessionId,
+          message: msg,
+          conversation_history: conversationHistory,
+        }),
+      });
+
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+
+      appendMessage('assistant', data.reply, {
+        injected: data.context_injected,
+        memoriesUsed: data.memories_used?.length || 0,
+        stored: true
+      });
+
+      conversationHistory.push({ role: 'user', content: msg });
+      conversationHistory.push({ role: 'assistant', content: data.reply });
+
+      setTimeout(loadMemories, 800);
+    } catch (err) {
+      appendMessage('assistant', `⚠️ Error: ${err.message}. Check that agent.py is running on port 8001.`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function appendMessage(role, text, meta = null) {
+    const container = document.getElementById('messages');
+    const div = document.createElement('div');
+    div.className = `message ${role}`;
+    let html = `<div class="bubble">${escapeHtml(text)}</div>`;
+    if (meta) {
+      let badges = '';
+      if (meta.injected) {
+        badges += `<span class="memory-badge">⚡ ${meta.memoriesUsed} memories recalled</span>`;
+      }
+      if (meta.stored) {
+        badges += `<span class="memory-badge stored">✓ stored</span>`;
+      }
+      if (badges) html += `<div class="meta">${badges}</div>`;
+    }
+    div.innerHTML = html;
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+  }
+
+  function setLoading(on) {
+    document.getElementById('typing').className = on ? 'typing visible' : 'typing';
+    document.getElementById('sendBtn').disabled = on;
+    if (!on) document.getElementById('messages').scrollTop = 999999;
+  }
+
+  function escapeHtml(t) {
+    return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  async function loadMemories() {
+    const userId = document.getElementById('userId').value.trim() || 'default_user';
+    try {
+      const resp = await fetch(`${API_BASE}/chat/memories/${userId}?limit=30`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      renderMemories(data.memories || []);
+    } catch { }
+  }
+
+function renderMemories(memories) {
+  const list = document.getElementById('memoryList');
+  if (!memories.length) {
+    list.innerHTML = '<div class="empty-state">No memories yet.<br>Start chatting to build memory.</div>';
+    return;
+  }
+  list.innerHTML = memories.map(m => {
+    const score = m.importance_score || 0;
+    const pct = Math.round(score * 100);
+    const scoreClass = score >= 0.6 ? 'high' : score >= 0.3 ? 'mid' : 'low';
+    const isFresh = m.id === lastStoredId;
+    const content = (m.content || '').slice(0, 120) + (m.content?.length > 120 ? '…' : '');
+    const expires = m.expires_at ? `expires ${new Date(m.expires_at).toLocaleDateString()}` : 'permanent';
+    const created = m.created_at ? new Date(m.created_at).toLocaleString([], { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' }) : '';
+    return `
+      <div class="memory-card ${isFresh ? 'fresh' : ''}" id="card-${m.id}">
+        <div class="memory-content">
+          <button class="delete-btn" onclick="deleteMemory('${m.id}')" title="Delete this memory">🗑</button>
+          ${escapeHtml(content)}
+        </div>
+        <div class="memory-score-bar">
+          <div class="score-track"><div class="score-fill ${scoreClass}" style="width:${pct}%"></div></div>
+          <div class="score-label">${score.toFixed(2)}</div>
+        </div>
+        <div class="memory-meta">${created} · ${expires}</div>
+      </div>`;
+  }).join('');
+  const memoryList = document.getElementById('memoryList');
+  memoryList.scrollTop = memoryList.scrollHeight;
+}
+
+  document.getElementById('userId').addEventListener('change', () => {
+    sessionId = crypto.randomUUID();
+    document.getElementById('sessionLabel').textContent = `session: ${sessionId.slice(0, 8)}…`;
+    conversationHistory = [];
+    lastStoredId = null;
+    document.getElementById('messages').innerHTML = `
+      <div class="message assistant">
+        <div class="bubble">Switched to a new user — chat cleared. Loading this user's stored memories…</div>
+      </div>`;
+    loadMemories();
+  });
+
+  loadMemories();
+
+  document.getElementById('input').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+
+  document.getElementById('input').addEventListener('input', function() {
+    this.style.height = 'auto';
+    this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+  });
+
+  async function deleteMemory(memoryId) {
+  try {
+    const resp = await fetch(`${API_BASE}/memory/${memoryId}`, { method: 'DELETE' });
+    if (resp.ok) loadMemories();
+  } catch (err) {
+    console.error('Delete failed:', err);
+  }
+}
+
+async function clearAllMemories() {
+  const userId = document.getElementById('userId').value.trim() || 'default_user';
+  if (!confirm(`Delete ALL memories for "${userId}"? This cannot be undone.`)) return;
+  try {
+    const resp = await fetch(`${API_BASE}/memories/${userId}`, { method: 'DELETE' });
+    if (resp.ok) {
+      lastStoredId = null;
+      loadMemories();
+    }
+  } catch (err) {
+    console.error('Clear all failed:', err);
+  }
+}
+</script>
+</body>
+</html>

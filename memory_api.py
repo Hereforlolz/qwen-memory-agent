@@ -33,7 +33,7 @@ qwen = AsyncOpenAI(
     base_url=os.getenv("QWEN_BASE_URL"),
 )
 
-QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen3.7-plus")
+QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen-plus")
 QWEN_EMBEDDING_MODEL = os.getenv("QWEN_EMBEDDING_MODEL", "text-embedding-v3")
 
 # =============================================================================
@@ -192,6 +192,31 @@ async def build_context_window(memories: List[Dict], query: str) -> str:
     return resp.choices[0].message.content.strip()
 
 # =============================================================================
+# DEDUPLICATION
+# =============================================================================
+
+async def is_duplicate(content: str, user_id: str, threshold: float = 0.92) -> bool:
+    """Check if a semantically similar memory already exists"""
+    try:
+        embedding = await get_embedding(content)
+        embedding_str = f"[{','.join(str(x) for x in embedding)}]"
+        async with db.pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT 1 - (embedding <=> $1::vector) as similarity
+                FROM memories
+                WHERE user_id = $2
+                AND (expires_at IS NULL OR expires_at > NOW())
+                ORDER BY embedding <=> $1::vector
+                LIMIT 1
+            """, embedding_str, user_id)
+        if row and float(row['similarity']) >= threshold:
+            return True
+        return False
+    except Exception as e:
+        logger.warning(f"Dedup check failed: {e}")
+        return False
+
+# =============================================================================
 # SMART FORGET
 # =============================================================================
 
@@ -296,7 +321,12 @@ async def health():
 
 @app.post("/memory", response_model=MemoryResponse)
 async def store_memory(entry: MemoryCreate):
-    """Store a memory — Qwen scores importance + generates embedding"""
+    """Store a memory — Qwen scores importance + generates embedding. Skips duplicates."""
+    # dedup check before doing any expensive Qwen calls
+    if await is_duplicate(entry.content, entry.user_id):
+        logger.info(f"Skipping duplicate memory: {entry.content[:60]}")
+        raise HTTPException(status_code=409, detail="Duplicate memory — similar content already exists")
+
     importance, embedding = await asyncio.gather(
         score_importance(entry.content),
         get_embedding(entry.content)
@@ -362,17 +392,16 @@ async def recall_memories(request: RecallRequest):
             LIMIT $3
         """, embedding_str, request.user_id, request.top_k)
 
-    memories = []
-    for row in rows:
-        memories.append({
-            "id": str(row['id']),
-            "content": row['content'],
-            "importance_score": row['importance_score'],
-            "similarity": float(row['similarity']),
-            "session_id": row['session_id'],
-            "created_at": row['created_at'].isoformat()
-        })
-        async with db.pool.acquire() as conn:
+        memories = []
+        for row in rows:
+            memories.append({
+                "id": str(row['id']),
+                "content": row['content'],
+                "importance_score": row['importance_score'],
+                "similarity": float(row['similarity']),
+                "session_id": row['session_id'],
+                "created_at": row['created_at'].isoformat()
+            })
             await conn.execute("""
                 UPDATE memories SET access_count = access_count + 1,
                 last_accessed = NOW() WHERE id = $1
@@ -402,6 +431,31 @@ async def list_memories(user_id: str, limit: int = 20):
         """, user_id, limit)
 
     return [dict(r) for r in rows]
+
+@app.delete("/memory/{memory_id}")
+async def delete_memory(memory_id: str):
+    """Hard delete a single memory by ID"""
+    async with db.pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM memories WHERE id = $1",
+            uuid.UUID(memory_id)
+        )
+    await db.redis.delete(f"memory:{memory_id}")
+    deleted = result.split()[-1]
+    if deleted == "0":
+        raise HTTPException(status_code=404, detail="Memory not found")
+    return {"deleted": True, "id": memory_id}
+
+@app.delete("/memories/{user_id}")
+async def delete_all_memories(user_id: str):
+    """Nuke all memories for a user"""
+    async with db.pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM memories WHERE user_id = $1",
+            user_id
+        )
+    count = int(result.split()[-1])
+    return {"deleted": True, "user_id": user_id, "count": count}
 
 if __name__ == "__main__":
     import uvicorn
