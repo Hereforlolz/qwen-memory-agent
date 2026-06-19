@@ -27,13 +27,11 @@ QWEN_API_KEY = os.getenv("QWEN_API_KEY")
 QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Lazily import asyncpg to prevent startup crashes if environment is building
 try:
     import asyncpg
 except ImportError:
     logger.error("asyncpg is required for this backend database. Run: pip install asyncpg")
 
-# Optional Redis Import for Caching
 try:
     import redis.asyncio as aioredis
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -51,8 +49,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── DATABASE CONFIGURATION AND UTILITIES ─────────────────────────────────────
-
 class DatabaseManager:
     def __init__(self):
         self.pool: Optional[asyncpg.Pool] = None
@@ -67,8 +63,7 @@ class DatabaseManager:
                 timeout=30.0
             )
             logger.info("[DB] Connected to PostgreSQL Connection Pool successfully.")
-            
-            # Auto-ensure vector extension and memories table structure exists
+
             async with self.pool.acquire() as conn:
                 await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
                 await conn.execute("""
@@ -113,8 +108,6 @@ async def startup():
 async def shutdown():
     await db.close()
 
-# ── HELPER MODELS & PIPELINE ROUTINES ────────────────────────────────────────
-
 class MemoryCreate(BaseModel):
     user_id: str
     session_id: str
@@ -140,6 +133,16 @@ class RecallRequest(BaseModel):
 class RecallResponse(BaseModel):
     context_window: str
     memories: List[dict]
+
+
+@app.get("/health")
+async def health():
+    """Basic liveness check — confirms DB pool and Redis are reachable."""
+    async with db.pool.acquire() as conn:
+        await conn.fetchval("SELECT 1")
+    if db.redis:
+        await db.redis.ping()
+    return {"status": "healthy"}
 
 
 async def get_embedding(text: str) -> List[float]:
@@ -198,11 +201,9 @@ async def manage_duplicates_and_conflicts(content: str, user_id: str, embedding:
 
         for row in rows:
             sim = row['similarity']
-            # Identical match context bypass
             if sim > 0.96 or row['content'].strip().lower() == content.strip().lower():
                 return "SKIP"
-                
-            # Semantic conflict check - let Qwen resolve updates
+
             if sim > 0.82:
                 try:
                     prompt = f"""Compare these statements from the same user:
@@ -213,7 +214,7 @@ Does the New Input explicitly correct, modify, update, or contradict the Old Sav
 Reply 'UPDATE' if the old memory is stale or overwritten. 
 Reply 'NEW' if both statements are distinctly valid and independent context notes.
 Return ONLY 'UPDATE' or 'NEW'."""
-                    
+
                     res = await qwen.chat.completions.create(
                         model="qwen-plus",
                         messages=[{"role": "user", "content": prompt}],
@@ -225,26 +226,23 @@ Return ONLY 'UPDATE' or 'NEW'."""
                         return str(row['id'])
                 except Exception as e:
                     logger.error(f"[Triage System Error] Resolution skipped: {e}")
-                    
+
         return None
 
-# ── API ENDPOINTS ─────────────────────────────────────────────────────────────
 
 @app.post("/memory", response_model=MemoryResponse)
 async def store_memory(entry: MemoryCreate):
     """Store a memory — Qwen scores importance + generates embedding. Skips duplicates cleanly."""
     try:
-        # 1. Generate clean list of floats from Qwen
         embedding = await get_embedding(entry.content)
         embedding_str = f"[{','.join(str(x) for x in embedding)}]"
-        
-        # 2. Run clean safety triage
+
         status = await manage_duplicates_and_conflicts(entry.content, entry.user_id, embedding)
-        
+
         if status == "SKIP":
             logger.info(f"Rejecting redundant memory: {entry.content[:60]}")
             raise HTTPException(status_code=409, detail="Duplicate memory exists")
-            
+
         importance = await score_importance(entry.content)
 
         if importance < 0.3:
@@ -255,7 +253,6 @@ async def store_memory(entry: MemoryCreate):
             expires_at = None
 
         async with db.pool.acquire() as conn:
-            # If status has a valid UUID string, overwrite it
             if status and status != "SKIP":
                 logger.info(f"Overwriting stale memory row: {status}")
                 row = await conn.fetchrow("""
@@ -267,7 +264,6 @@ async def store_memory(entry: MemoryCreate):
                 if db.redis:
                     await db.redis.delete(f"memory:{status}")
             else:
-                # Fresh row creation block
                 row = await conn.fetchrow("""
                     INSERT INTO memories
                         (user_id, session_id, content, embedding, importance_score, expires_at, metadata)
@@ -316,7 +312,6 @@ async def recall_memories(request: RecallRequest):
         embedding_str = f"[{','.join(str(x) for x in embedding)}]"
 
         async with db.pool.acquire() as conn:
-            # Prioritizes high-importance core facts first, then cross-session matching semantics
             rows = await conn.fetch("""
                 SELECT id, content, importance_score, created_at, session_id,
                        1 - (embedding <=> $1::vector) as similarity
@@ -360,7 +355,7 @@ async def list_user_memories(user_id: str, limit: int = 30):
             ORDER BY created_at DESC
             LIMIT $2
         """, user_id, limit)
-        
+
         return [
             {
                 "id": str(r['id']),
@@ -396,8 +391,6 @@ async def flush_user_vault(user_id: str):
     async with db.pool.acquire() as conn:
         await conn.execute("DELETE FROM memories WHERE user_id = $1", user_id)
     return {"status": "cleared", "user_id": user_id}
-
-# ── Entry Initialization Guard ───────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
