@@ -43,7 +43,8 @@ A full chat turn was executed against the live Alibaba Cloud deployment, confirm
 - Qwen Cloud API connectivity (chat completion + embeddings) from the ECS instance
 - Neon Postgres (pgvector) connectivity for memory storage/recall
 - Upstash Redis connectivity for caching
-- Memory recall and context injection working end-to-end on the deployed instance
+- Weighted deduplication and conflict resolution (SKIP / UPDATE / NEW) working end-to-end
+- Importance-first recall ranking and memory injection working end-to-end on the deployed instance
 
 ```
 POST http://<ECS-public-ip>:8001/chat
@@ -53,7 +54,8 @@ Response (truncated):
 {
   "reply": "Hello again, Nidhi! It looks like the new API key for your Qwen MemoryAgent project is working perfectly...",
   "context_injected": true,
-  "memories_used": [ ...5 memories recalled via pgvector similarity search... ]
+  "memories_used": [ ...memories recalled via pgvector, importance-first ranking... ],
+  "memories_stored": [ ...newly extracted memories, deduplicated and conflict-checked before insert... ]
 }
 ```
 
@@ -76,3 +78,5 @@ See [`architecture.md`](./architecture.md) for the full system diagram showing h
 - All credentials (Qwen API key, database URL, Redis URL) are stored in a `.env` file on the instance, excluded from version control via `.gitignore`.
 - Credentials used during development/testing were rotated prior to final submission as a security precaution.
 - Services are configured to auto-restart detached from the SSH session via `nohup`, ensuring uptime independent of any single terminal connection.
+- Instance is stopped between work sessions to conserve free-tier credit; restarted via the ECS console before each deployment verification or demo recording. Pay-as-you-go billing only charges for active runtime hours.
+- Deployed code is kept in sync with the `main` branch via `git pull` on the instance before each verification pass.
