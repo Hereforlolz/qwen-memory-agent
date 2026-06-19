@@ -42,14 +42,18 @@ app.add_middleware(
 async def recall_context(user_id: str, query: str) -> tuple[str, list[dict]]:
     """Returns (context_window string, raw memories list)"""
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(
-            f"{MEMORY_API_URL}/recall",
-            json={"user_id": user_id, "query": query, "top_k": 5},
-        )
-        if resp.status_code != 200:
+        try:
+            resp = await client.post(
+                f"{MEMORY_API_URL}/recall",
+                json={"user_id": user_id, "query": query, "top_k": 10},
+            )
+            if resp.status_code != 200:
+                return "", []
+            data = resp.json()
+            return data.get("context_window", ""), data.get("memories", [])
+        except Exception as e:
+            print(f"[ERROR] Recall communication failed: {e}")
             return "", []
-        data = resp.json()
-        return data.get("context_window", ""), data.get("memories", [])
 
 
 async def store_memory(user_id: str, session_id: str, content: str, metadata: dict = None) -> dict:
@@ -84,14 +88,18 @@ async def store_memory(user_id: str, session_id: str, content: str, metadata: di
 async def list_memories(user_id: str, limit: int = 20) -> list[dict]:
     """API returns a plain list"""
     async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(
-            f"{MEMORY_API_URL}/memories/{user_id}",
-            params={"limit": limit},
-        )
-        if resp.status_code != 200:
+        try:
+            resp = await client.get(
+                f"{MEMORY_API_URL}/memories/{user_id}",
+                params={"limit": limit},
+            )
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            print(f"[ERROR] List memories failed: {e}")
             return []
-        data = resp.json()
-        return data if isinstance(data, list) else []
 
 
 # ── core chat turn ────────────────────────────────────────────────────────────
@@ -138,9 +146,12 @@ Reference memories naturally when relevant. Don't force it.
         print(f"[ERROR] Qwen call failed: {e}")
 
     # 5. extract structured memories from this turn
+    stored_pipeline_results = []
     try:
         extract_prompt = f"""Extract important memories from this conversation turn as a list of concise statements.
-Focus on facts, user preferences, goals, project details, personal info, and action items.
+        Focus on facts, user preferences, goals, project details, personal info, and action items.
+        CRITICAL: Never extract negative facts or the absence of information (e.g., "User does not have a car" or "User has no recorded history of X"). 
+        If the user doesn't state a fact, do not generate a memory row for it.
 
 User: {user_message}
 Assistant: {assistant_reply}
@@ -162,26 +173,32 @@ Return only a JSON array of strings. Example: ["Nidhi is working on Qwen MemoryA
             memories_list = json.loads(extracted_text)
             if isinstance(memories_list, list):
                 for mem in memories_list[:3]:
-                    await store_memory(
+                    save_res = await store_memory(
                         user_id,
                         session_id,
                         str(mem),
                         metadata={"source": "chat_agent", "type": "extracted"}
                     )
+                    if save_res and "id" in save_res:
+                        stored_pipeline_results.append(save_res)
         except Exception:
             # fallback: store summary
             summary = f"User: {user_message[:200]} | Assistant: {assistant_reply[:200]}"
-            await store_memory(user_id, session_id, summary)
+            save_res = await store_memory(user_id, session_id, summary)
+            if save_res and "id" in save_res:
+                stored_pipeline_results.append(save_res)
 
     except Exception as e:
         # fallback: store raw user message
-        await store_memory(user_id, session_id, f"User said: {user_message}")
+        save_res = await store_memory(user_id, session_id, f"User said: {user_message}")
+        if save_res and "id" in save_res:
+            stored_pipeline_results.append(save_res)
         print(f"[WARN] Memory extraction failed, stored basic memory: {e}")
 
     return {
         "reply": assistant_reply,
         "memories_used": memories_used,
-        "memory_stored": {"status": "stored", "id": "multiple"},
+        "memories_stored": stored_pipeline_results,
         "context_injected": bool(context_str.strip()),
     }
 
@@ -197,8 +214,8 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
-    memories_used: list[dict]
-    memory_stored: dict
+    memories_used: list
+    memories_stored: list
     context_injected: bool
     session_id: str
 
@@ -228,10 +245,13 @@ async def health():
 @app.delete("/memory/{memory_id}")
 async def delete_memory_proxy(memory_id: str):
     async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.delete(f"{MEMORY_API_URL}/memory/{memory_id}")
-        if resp.status_code == 404:
-            raise HTTPException(status_code=404, detail="Memory not found")
-        return resp.json()
+        try:
+            resp = await client.delete(f"{MEMORY_API_URL}/memory/{memory_id}")
+            if resp.status_code == 404:
+                raise HTTPException(status_code=404, detail="Memory not found")
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=e.response.status_code, detail="Memory service error")
 
 
 @app.delete("/memories/{user_id}")

@@ -83,9 +83,15 @@ The result: an agent that gets more useful over time, not less.
 - `0.3–0.6` → expires in 7 days
 - `< 0.3` → expires in 24 hours (greetings, filler)
 
-**Semantic recall** — pgvector cosine similarity, ranked by `similarity × importance_score` so high-importance memories surface first even with moderate similarity.
+**Importance-first recall** — pgvector cosine similarity, ranked `ORDER BY importance_score DESC, similarity DESC`. This guarantees a user's core profile facts (name, project, deadlines) surface on the very first turn of a new session, even before enough conversation exists for a strong semantic match.
 
-**Context synthesis** — recalled memories aren't dumped raw into the prompt. Qwen synthesizes them into a 3-sentence context paragraph tuned to the current query.
+**Weighted duplicate/conflict detection** — before storing, candidate memories are ranked by a blended score (`60% similarity + 40% importance`) and checked against the new content:
+- **similarity > 0.96** or exact text match → rejected as duplicate (`409`)
+- **similarity > 0.82** → Qwen arbitrates: does the new fact `UPDATE` (correct/supersede) the old one, or is it a `NEW` independent fact? If `UPDATE`, the old row is overwritten in place rather than creating a redundant entry.
+
+**Negative-fact filtering** — the extraction prompt explicitly forbids generating memories from absence-of-information statements (e.g. "user doesn't have a car"), preventing the memory store from filling with noise.
+
+**Context synthesis** — recalled memories aren't dumped raw into the prompt. Qwen synthesizes them into a concise context paragraph tuned to the current query.
 
 **Smart extraction** — after each turn, a second Qwen call extracts structured facts from the conversation (up to 3 per turn) rather than storing raw message text.
 
@@ -182,7 +188,7 @@ python seed_memories.py
 
 | Method | Endpoint | Description |
 |---|---|---|
-| POST | `/chat` | Full memory-injected chat turn |
+| POST | `/chat` | Full memory-injected chat turn — returns `memories_stored: list[dict]` |
 | GET | `/chat/memories/{user_id}` | Memory panel data for frontend |
 | GET | `/health` | Health check |
 

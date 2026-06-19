@@ -357,7 +357,7 @@
 
     appendMessage('user', msg);
     input.value = '';
-    input.style.height = 'auto';
+    input.style.height = '42px'; // FIXED: Hard reset height immediately after clear
     setLoading(true);
 
     try {
@@ -383,6 +383,11 @@
 
       conversationHistory.push({ role: 'user', content: msg });
       conversationHistory.push({ role: 'assistant', content: data.reply });
+
+      // Track the latest stored memory ID if returned in the new plural array array layout
+      if (data.memories_stored && data.memories_stored.length > 0) {
+         lastStoredId = data.memories_stored[0].id;
+      }
 
       setTimeout(loadMemories, 800);
     } catch (err) {
@@ -428,40 +433,43 @@
       const resp = await fetch(`${API_BASE}/chat/memories/${userId}?limit=30`);
       if (!resp.ok) return;
       const data = await resp.json();
-      renderMemories(data.memories || []);
-    } catch { }
+      
+      // FIXED: Handles data variations if array is returned bare or wrapped inside an object
+      const cleanMemoriesList = Array.isArray(data) ? data : data.memories || [];
+      renderMemories(cleanMemoriesList);
+    } catch (err) {
+       console.error("Failed fetching context rows:", err);
+    }
   }
 
-function renderMemories(memories) {
-  const list = document.getElementById('memoryList');
-  if (!memories.length) {
-    list.innerHTML = '<div class="empty-state">No memories yet.<br>Start chatting to build memory.</div>';
-    return;
+  function renderMemories(memories) {
+    const list = document.getElementById('memoryList');
+    if (!memories || !memories.length) {
+      list.innerHTML = '<div class="empty-state">No memories yet.<br>Start chatting to build memory.</div>';
+      return;
+    }
+    list.innerHTML = memories.map(m => {
+      const score = m.importance_score || 0;
+      const pct = Math.round(score * 100);
+      const scoreClass = score >= 0.6 ? 'high' : score >= 0.3 ? 'mid' : 'low';
+      const isFresh = m.id === lastStoredId;
+      const content = (m.content || '').slice(0, 120) + (m.content?.length > 120 ? '…' : '');
+      const expires = m.expires_at ? `expires ${new Date(m.expires_at).toLocaleDateString()}` : 'permanent';
+      const created = m.created_at ? new Date(m.created_at).toLocaleString([], { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' }) : '';
+      return `
+        <div class="memory-card ${isFresh ? 'fresh' : ''}" id="card-${m.id}">
+          <div class="memory-content">
+            <button class="delete-btn" onclick="deleteMemory('${m.id}')" title="Delete this memory">🗑</button>
+            ${escapeHtml(content)}
+          </div>
+          <div class="memory-score-bar">
+            <div class="score-track"><div class="score-fill ${scoreClass}" style="width:${pct}%"></div></div>
+            <div class="score-label">${score.toFixed(2)}</div>
+          </div>
+          <div class="memory-meta">${created} · ${expires}</div>
+        </div>`;
+    }).join('');
   }
-  list.innerHTML = memories.map(m => {
-    const score = m.importance_score || 0;
-    const pct = Math.round(score * 100);
-    const scoreClass = score >= 0.6 ? 'high' : score >= 0.3 ? 'mid' : 'low';
-    const isFresh = m.id === lastStoredId;
-    const content = (m.content || '').slice(0, 120) + (m.content?.length > 120 ? '…' : '');
-    const expires = m.expires_at ? `expires ${new Date(m.expires_at).toLocaleDateString()}` : 'permanent';
-    const created = m.created_at ? new Date(m.created_at).toLocaleString([], { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' }) : '';
-    return `
-      <div class="memory-card ${isFresh ? 'fresh' : ''}" id="card-${m.id}">
-        <div class="memory-content">
-          <button class="delete-btn" onclick="deleteMemory('${m.id}')" title="Delete this memory">🗑</button>
-          ${escapeHtml(content)}
-        </div>
-        <div class="memory-score-bar">
-          <div class="score-track"><div class="score-fill ${scoreClass}" style="width:${pct}%"></div></div>
-          <div class="score-label">${score.toFixed(2)}</div>
-        </div>
-        <div class="memory-meta">${created} · ${expires}</div>
-      </div>`;
-  }).join('');
-  const memoryList = document.getElementById('memoryList');
-  memoryList.scrollTop = memoryList.scrollHeight;
-}
 
   document.getElementById('userId').addEventListener('change', () => {
     sessionId = crypto.randomUUID();
@@ -490,27 +498,27 @@ function renderMemories(memories) {
   });
 
   async function deleteMemory(memoryId) {
-  try {
-    const resp = await fetch(`${API_BASE}/memory/${memoryId}`, { method: 'DELETE' });
-    if (resp.ok) loadMemories();
-  } catch (err) {
-    console.error('Delete failed:', err);
-  }
-}
-
-async function clearAllMemories() {
-  const userId = document.getElementById('userId').value.trim() || 'default_user';
-  if (!confirm(`Delete ALL memories for "${userId}"? This cannot be undone.`)) return;
-  try {
-    const resp = await fetch(`${API_BASE}/memories/${userId}`, { method: 'DELETE' });
-    if (resp.ok) {
-      lastStoredId = null;
-      loadMemories();
+    try {
+      const resp = await fetch(`${API_BASE}/memory/${memoryId}`, { method: 'DELETE' });
+      if (resp.ok) loadMemories();
+    } catch (err) {
+      console.error('Delete failed:', err);
     }
-  } catch (err) {
-    console.error('Clear all failed:', err);
   }
-}
+
+  async function clearAllMemories() {
+    const userId = document.getElementById('userId').value.trim() || 'default_user';
+    if (!confirm(`Delete ALL memories for "${userId}"? This cannot be undone.`)) return;
+    try {
+      const resp = await fetch(`${API_BASE}/memories/${userId}`, { method: 'DELETE' });
+      if (resp.ok) {
+        lastStoredId = null;
+        loadMemories();
+      }
+    } catch (err) {
+      console.error('Clear all failed:', err);
+    }
+  }
 </script>
 </body>
 </html>

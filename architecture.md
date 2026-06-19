@@ -58,59 +58,80 @@ sequenceDiagram
     participant R as Upstash Redis
 
     U->>A: POST /chat {message}
-    A->>M: POST /recall {query}
+    A->>M: POST /recall {query, top_k: 10}
     M->>Q: embed(query)
     Q-->>M: embedding vector
-    M->>N: cosine similarity search<br/>ranked by similarity × importance
-    N-->>M: top-k memories
-    M->>Q: synthesize context window
-    Q-->>M: context summary
+    M->>N: ORDER BY importance_score DESC,<br/>similarity DESC
+    N-->>M: top-k memories<br/>(importance-first)
     M-->>A: {memories, context_window}
 
     A->>Q: chat completion<br/>(system prompt + memory context + history)
     Q-->>A: assistant reply
 
-    A->>Q: extract structured memories<br/>from this turn
+    A->>Q: extract structured memories<br/>(excludes negative/absence facts)
     Q-->>A: JSON array of facts
 
-    loop for each extracted memory
+    loop for each extracted memory (max 3)
         A->>M: POST /memory {content}
-        M->>N: check duplicate (cosine similarity ≥ 0.92)
-        alt not duplicate
+        M->>Q: embed(content)
+        Q-->>M: embedding vector
+        M->>N: rank candidates by<br/>60% similarity + 40% importance
+        N-->>M: top-3 candidates
+
+        alt similarity > 0.96 or exact match
+            M-->>A: 409 — SKIP (duplicate)
+        else similarity > 0.82
+            M->>Q: arbitrate: UPDATE or NEW?
+            Q-->>M: verdict
+            alt verdict = UPDATE
+                M->>N: UPDATE existing row<br/>(content, embedding, score)
+                M->>R: invalidate old cache entry
+            else verdict = NEW
+                M->>Q: score importance (0–1)
+                Q-->>M: score
+                M->>N: INSERT new row
+                M->>R: cache memory (1hr TTL)
+            end
+        else no close match
             M->>Q: score importance (0–1)
             Q-->>M: score
-            M->>Q: embed(content)
-            Q-->>M: embedding vector
-            M->>N: INSERT memory + embedding
+            M->>N: INSERT new row
             M->>R: cache memory (1hr TTL)
-        else duplicate
-            M-->>A: 409 Conflict (skipped)
         end
     end
 
-    A-->>U: {reply, memories_used, context_injected}
+    A-->>U: {reply, memories_used,<br/>memories_stored, context_injected}
 ```
 
 ## Memory Lifecycle
 
 ```mermaid
 flowchart LR
-    A[New memory content] --> B{Duplicate check<br/>cosine similarity ≥ 0.92?}
-    B -->|Yes| C[Reject — 409]
-    B -->|No| D[Qwen scores importance<br/>0.0 – 1.0]
-    D --> E{Score range}
-    E -->|< 0.3| F[TTL: 24 hours]
-    E -->|0.3 – 0.6| G[TTL: 7 days]
-    E -->|≥ 0.6| H[Permanent]
-    F --> I[(Stored in Neon<br/>+ pgvector embedding)]
-    G --> I
-    H --> I
-    I --> J[Cached in Redis<br/>1hr TTL]
+    A[New memory content] --> B[Embed content<br/>+ rank top-3 candidates<br/>60% similarity + 40% importance]
+    B --> C{Top candidate<br/>similarity?}
+    C -->|> 0.96 or exact match| D[Reject — 409 SKIP]
+    C -->|0.82 – 0.96| E[Qwen arbitrates:<br/>UPDATE or NEW?]
+    C -->|< 0.82| F[Treat as NEW]
 
-    K[Smart Forget<br/>triggered] --> L[Fetch expired<br/>low-importance memories]
-    L --> M[Qwen reviews:<br/>delete or keep?]
-    M -->|delete| N[Removed from Neon]
-    M -->|keep| I
+    E -->|UPDATE| G[Overwrite existing row<br/>content, embedding, score]
+    E -->|NEW| F
+
+    F --> H[Qwen scores importance<br/>0.0 – 1.0]
+    H --> I{Score range}
+    I -->|< 0.3| J[TTL: 24 hours]
+    I -->|0.3 – 0.6| K[TTL: 7 days]
+    I -->|≥ 0.6| L[Permanent]
+
+    J --> M[(Stored in Neon<br/>+ pgvector embedding)]
+    K --> M
+    L --> M
+    G --> M
+    M --> N[Cached in Redis<br/>1hr TTL]
+
+    O[Smart Forget<br/>triggered] --> P[Fetch expired<br/>low-importance memories]
+    P --> Q[Qwen reviews:<br/>delete or keep?]
+    Q -->|delete| R[Removed from Neon]
+    Q -->|keep| M
 ```
 
 ## Component Responsibilities
@@ -134,4 +155,4 @@ flowchart LR
 
 **Two-step memory write (extract, then store)** — instead of storing the raw user message, `agent.py` asks Qwen to extract structured facts first. This produces cleaner, more reusable memories ("User prefers concise explanations") instead of noisy raw text ("yeah I guess I'd rather you keep it short tbh").
 
-**Deduplication at write time** — checks cosine similarity against existing memories before storing, preventing the same fact from being re-stored every session (a common failure mode in naive memory systems).
+**Deduplication and conflict resolution at write time** — rather than blind dedup, candidate memories are ranked by a blended similarity+importance score and Qwen arbitrates whether a close match should be treated as a duplicate (reject), an update (overwrite the stale fact), or a genuinely new independent memory. This handles the common case where a user's stated preference changes over time ("I prefer Python" → "actually I've switched to Rust") without leaving stale, contradictory memories in the store.
