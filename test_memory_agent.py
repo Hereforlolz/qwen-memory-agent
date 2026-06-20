@@ -18,6 +18,8 @@ Each test prints PASS/FAIL and a short reason. A final summary tells you
 whether the system is demo-ready.
 """
 import sys
+import os
+import re
 import time
 import uuid
 import argparse
@@ -30,6 +32,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--remote", help="Public IP of your Alibaba Cloud ECS instance")
 parser.add_argument("--memory-port", default="8000")
 parser.add_argument("--agent-port", default="8001")
+parser.add_argument("--frontend-file", default="frontend/index.html",
+                     help="Path to index.html to validate structurally (default: frontend/index.html)")
 args = parser.parse_args()
 
 HOST = args.remote if args.remote else "localhost"
@@ -373,6 +377,107 @@ def test_qwen_connectivity():
     )
 
 
+# ── 10. Frontend file structural validation (no browser required) ───────────
+
+def test_frontend_file():
+    """
+    Validates frontend/index.html on disk without needing a browser. Catches the
+    kind of regressions that have actually broken this app before:
+      - crypto.randomUUID() called without a fallback (fails outside HTTPS/localhost)
+      - API_BASE hardcoded to localhost (breaks every fetch when deployed elsewhere)
+      - userId defaulting to a real person's name (leaks personal memory data to visitors)
+      - userId interpolated into a fetch URL without encodeURIComponent
+      - new buttons/panels referencing JS functions that don't exist (typo-class bugs)
+      - basic HTML tag balance, since a stray unclosed tag can silently break layout
+    """
+    section("10. Frontend File Validation (frontend/index.html)")
+
+    path = args.frontend_file
+    if not os.path.exists(path):
+        check(f"frontend file exists at {path!r}", False, "file not found — pass --frontend-file <path> if it's elsewhere")
+        return
+
+    content = open(path, encoding="utf-8").read()
+    check(f"frontend file exists at {path!r}", True)
+
+    # --- regression 1: crypto.randomUUID() called directly, without feature detection ---
+    # A bare call (not inside the generateUUID() fallback itself) means it'll throw
+    # on any non-HTTPS, non-localhost origin — this broke user-switching once before.
+    bare_random_uuid = re.findall(r"(?<!typeof window\.crypto\.)crypto\.randomUUID\(\)", content)
+    # crude but effective: count usages NOT immediately preceded by a typeof-feature-detect check
+    has_fallback_fn = "function generateUUID" in content
+    direct_calls_outside_fallback = len(re.findall(r"sessionId = crypto\.randomUUID\(\)", content))
+    check(
+        "no unguarded crypto.randomUUID() calls outside a feature-detected fallback",
+        has_fallback_fn and direct_calls_outside_fallback == 0,
+        f"generateUUID() fallback present={has_fallback_fn}, direct unguarded calls={direct_calls_outside_fallback}"
+    )
+
+    # --- regression 2: API_BASE hardcoded to localhost ---
+    hardcoded = bool(re.search(r"API_BASE\s*=\s*['\"]http://localhost:\d+['\"]", content))
+    dynamic = "window.location.hostname" in content
+    check(
+        "API_BASE is derived dynamically, not hardcoded to localhost",
+        dynamic and not hardcoded,
+        "API_BASE uses window.location" if dynamic else "API_BASE still hardcoded — will break on any non-localhost deployment"
+    )
+
+    # --- regression 3: userId input defaults to a real name instead of empty ---
+    leaks_default_user = bool(re.search(r'id="userId"[^>]*value="(?!")[^"]+"', content))
+    check(
+        "User ID field has no hardcoded personal default value",
+        not leaks_default_user,
+        "userId input defaults to empty/placeholder-only" if not leaks_default_user else "userId input still has a hardcoded value= — visitors may see your personal memory data by default"
+    )
+
+    # --- regression 4: userId not URL-encoded in fetch calls ---
+    # every fetch template literal that embeds userId directly in the path should wrap it
+    unsafe_userid_urls = re.findall(r"fetch\(`\$\{API_BASE\}/[^`]*\$\{userId\}", content)
+    check(
+        "userId is URL-encoded before being inserted into fetch URLs",
+        len(unsafe_userid_urls) == 0,
+        "all userId path segments wrapped in encodeURIComponent" if not unsafe_userid_urls else f"found {len(unsafe_userid_urls)} unescaped usage(s)"
+    )
+
+    # --- regression 5: every onclick handler has a matching function definition ---
+    handlers = sorted(set(re.findall(r'onclick="(\w+)\(', content)))
+    missing_handlers = [h for h in handlers if not re.search(rf"function {h}\(", content)]
+    check(
+        "every onclick handler has a matching function definition",
+        len(missing_handlers) == 0,
+        f"all {len(handlers)} handlers resolved" if not missing_handlers else f"missing: {missing_handlers}"
+    )
+
+    # --- regression 6: basic tag balance for the most structurally important tags ---
+    tag_mismatches = []
+    for tag in ["div", "button", "script", "style"]:
+        opens = content.count(f"<{tag}")
+        closes = content.count(f"</{tag}>")
+        if opens != closes:
+            tag_mismatches.append(f"{tag} ({opens} open / {closes} close)")
+    check(
+        "core tags (div/button/script/style) are balanced",
+        len(tag_mismatches) == 0,
+        "balanced" if not tag_mismatches else f"mismatched: {', '.join(tag_mismatches)}"
+    )
+
+    # --- regression 7: intro/how-to-use panel is present (the latest addition) ---
+    has_intro = 'id="introPanel"' in content and "function showIntro" in content and "function hideIntro" in content
+    check(
+        "intro/how-to-use panel and its show/hide functions are present",
+        has_intro,
+        "introPanel + showIntro/hideIntro all found" if has_intro else "intro panel or its JS functions are missing"
+    )
+
+    # --- regression 8: smart forget button wired to the right endpoint ---
+    smart_forget_wired = bool(re.search(r"forget/\$\{encodeURIComponent\(userId\)\}", content)) and "function smartForget" in content
+    check(
+        "Smart Forget button calls the /forget/{userId} endpoint with encoding",
+        smart_forget_wired,
+        "wired correctly" if smart_forget_wired else "Smart Forget button or its fetch call is missing/misconfigured"
+    )
+
+
 # ── runner ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -388,6 +493,7 @@ def main():
     test_smart_forget()
     test_manual_delete(memory_id)
     test_qwen_connectivity()
+    test_frontend_file()
 
     section("SUMMARY")
     total = len(results)

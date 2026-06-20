@@ -261,6 +261,75 @@
     min-height: 0;
   }
   .forget-status.visible { color: #fbbf24; }
+  .intro-panel {
+    background: #16161e;
+    border-bottom: 1px solid #2a2a3a;
+    padding: 16px 20px;
+    flex-shrink: 0;
+    position: relative;
+    max-height: 280px;
+    overflow-y: auto;
+  }
+  .intro-panel.hidden { display: none; }
+  .intro-panel h2 {
+    font-size: 14px;
+    color: #a78bfa;
+    margin-bottom: 8px;
+    padding-right: 30px;
+  }
+  .intro-panel p {
+    font-size: 12.5px;
+    color: #b8b8cc;
+    line-height: 1.6;
+    margin-bottom: 8px;
+  }
+  .intro-panel ol, .intro-panel ul {
+    font-size: 12.5px;
+    color: #b8b8cc;
+    line-height: 1.7;
+    margin: 6px 0 10px 18px;
+  }
+  .intro-panel li { margin-bottom: 4px; }
+  .intro-panel code {
+    background: #0c0c12;
+    border: 1px solid #2a2a3a;
+    border-radius: 3px;
+    padding: 1px 5px;
+    font-size: 11.5px;
+    color: #34d399;
+  }
+  .intro-panel .intro-section-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: #6b6b8a;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    margin: 12px 0 4px;
+  }
+  .intro-panel .intro-section-title:first-of-type { margin-top: 0; }
+  .intro-close-btn {
+    position: absolute;
+    top: 14px;
+    right: 16px;
+    background: none;
+    border: 1px solid #2a2a3a;
+    border-radius: 4px;
+    color: #6b6b8a;
+    font-size: 11px;
+    padding: 3px 8px;
+    cursor: pointer;
+  }
+  .intro-close-btn:hover { color: #f87171; border-color: #4c1d2e; }
+  .show-intro-btn {
+    background: none;
+    border: 1px solid #2a2a3a;
+    border-radius: 4px;
+    padding: 3px 10px;
+    color: #a78bfa;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .show-intro-btn:hover { border-color: #4c1d95; }
   .delete-btn {
   background: none;
   border: none;
@@ -281,11 +350,52 @@
 <header>
   <div class="dot" id="statusDot"></div>
   <h1>Qwen MemoryAgent</h1>
+  <button class="show-intro-btn" id="showIntroBtn" onclick="showIntro()" style="margin-left:12px;">ℹ️ How this works</button>
   <span>Track 1 · Global AI Hackathon</span>
 </header>
+<div class="intro-panel" id="introPanel">
+  <button class="intro-close-btn" onclick="hideIntro()">✕ Close</button>
+  <h2>What is this?</h2>
+  <p>
+    MemoryAgent is a persistent memory layer for AI chat. Most chatbots forget everything the moment
+    a session ends — this one doesn't. Every fact you share gets scored for importance by Qwen, stored
+    with an embedding for semantic search, and recalled automatically in <em>future</em> sessions —
+    even if you close the tab, come back tomorrow, and never mention it again.
+  </p>
+
+  <div class="intro-section-title">Try this in under a minute</div>
+  <ol>
+    <li>Type a name into the <strong>User ID</strong> field above (e.g. <code>judge1</code>) and press Tab — this gives you a clean, isolated identity with no prior history.</li>
+    <li>Tell it a few facts about yourself in one message, e.g. <em>"My name is Alex, I'm a backend engineer, and I'm allergic to peanuts."</em></li>
+    <li>Click <strong>New Session</strong> (top bar) — this clears the visible chat, simulating a brand-new conversation.</li>
+    <li>Ask: <em>"What do you know about me?"</em> — it will recall what you said, even with zero visible chat history. That recall is the whole point.</li>
+  </ol>
+
+  <div class="intro-section-title">What's in the side panel</div>
+  <p>
+    Every stored memory shows a colored importance bar (Qwen's own 0–1 score) and an expiry date.
+    Low-importance facts (small talk, filler) expire in 24 hours; mid-importance in 7 days;
+    high-importance facts (names, goals, deadlines) are kept permanently.
+  </p>
+
+  <div class="intro-section-title">Things worth testing</div>
+  <ul>
+    <li><strong>Contradictions:</strong> tell it one preference, then later tell it the opposite — watch it decide whether to update the old memory or keep both as independent facts.</li>
+    <li><strong>🧹 Smart Forget:</strong> triggers a review of any memories past their expiry — Qwen makes a final keep/delete call on each rather than blind deletion.</li>
+    <li><strong>Duplicate facts:</strong> say the exact same thing twice — it should recognize the repeat and skip storing it again.</li>
+  </ul>
+
+  <div class="intro-section-title">Notes for evaluation</div>
+  <p>
+    Memory is isolated per User ID — different IDs never see each other's data. This is a hackathon
+    demo build: the User ID field is a simple text input rather than real authentication, by design,
+    to make testing fast. Source, architecture diagrams, and deployment details are in the GitHub repo.
+  </p>
+</div>
+
 <div class="user-bar">
   <label>User ID</label>
-  <input type="text" id="userId" placeholder="e.g. nidhi" value="nidhi" />
+  <input type="text" id="userId" placeholder="e.g. judge1, demo, your-name" value="" />
   <button class="refresh-btn" onclick="newSession()">New Session</button>
   <button class="refresh-btn" onclick="clearHistory()">Clear Chat</button>
   <span class="session-id" id="sessionLabel">session: —</span>
@@ -323,8 +433,39 @@
 </div>
 
 <script>
-  let API_BASE = 'http://localhost:8001';
-  let sessionId = crypto.randomUUID();
+  // crypto.randomUUID() only exists in secure contexts (HTTPS or localhost).
+  // The live deployment is served over plain HTTP, so it's unavailable there —
+  // this fallback works everywhere, using crypto.getRandomValues() if present,
+  // or Math.random() as a last resort.
+  function generateUUID() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+      return window.crypto.randomUUID();
+    }
+    if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
+      const bytes = new Uint8Array(16);
+      window.crypto.getRandomValues(bytes);
+      bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+      bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant
+      const hex = [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
+      return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+    }
+    // last-resort fallback, not cryptographically strong but fine for a session label
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+      const r = Math.random() * 16 | 0;
+      const v = c === 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+  }
+
+  // API_BASE was previously hardcoded to 'http://localhost:8001', which only
+  // works when the page itself is viewed from localhost. When loaded from the
+  // live deployment (e.g. http://<ECS-IP>:8001/app), that hardcoded value made
+  // every fetch() call silently target the *visitor's own machine* instead of
+  // the actual server — breaking chat, memory list, delete, and forget for
+  // anyone not running a local copy on the same port. Deriving it from
+  // window.location keeps it correct in both environments automatically.
+  let API_BASE = `${window.location.protocol}//${window.location.hostname}:8001`;
+  let sessionId = generateUUID();
   let conversationHistory = [];
   let lastStoredId = null;
 
@@ -341,8 +482,21 @@
   }
   checkHealth();
 
+  function hideIntro() {
+    document.getElementById('introPanel').classList.add('hidden');
+    document.getElementById('showIntroBtn').style.display = 'inline-block';
+  }
+
+  function showIntro() {
+    document.getElementById('introPanel').classList.remove('hidden');
+    document.getElementById('showIntroBtn').style.display = 'none';
+  }
+
+  // Hide the reopen button while the panel is already showing on first load
+  document.getElementById('showIntroBtn').style.display = 'none';
+
   function newSession() {
-    sessionId = crypto.randomUUID();
+    sessionId = generateUUID();
     document.getElementById('sessionLabel').textContent = `session: ${sessionId.slice(0, 8)}…`;
     conversationHistory = [];
     document.getElementById('messages').innerHTML = `
@@ -441,7 +595,7 @@
   async function loadMemories() {
     const userId = document.getElementById('userId').value.trim() || 'default_user';
     try {
-      const resp = await fetch(`${API_BASE}/chat/memories/${userId}?limit=30`);
+      const resp = await fetch(`${API_BASE}/chat/memories/${encodeURIComponent(userId)}?limit=30`);
       if (!resp.ok) return;
       const data = await resp.json();
       
@@ -483,7 +637,7 @@
   }
 
   document.getElementById('userId').addEventListener('change', () => {
-    sessionId = crypto.randomUUID();
+    sessionId = generateUUID();
     document.getElementById('sessionLabel').textContent = `session: ${sessionId.slice(0, 8)}…`;
     conversationHistory = [];
     lastStoredId = null;
@@ -523,7 +677,7 @@
     statusEl.textContent = 'Reviewing expired memories…';
     statusEl.className = 'forget-status visible';
     try {
-      const resp = await fetch(`${API_BASE}/forget/${userId}?batch_size=20`, { method: 'DELETE' });
+      const resp = await fetch(`${API_BASE}/forget/${encodeURIComponent(userId)}?batch_size=20`, { method: 'DELETE' });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
       const { reviewed = 0, deleted = 0, kept = 0 } = data;
@@ -543,7 +697,7 @@
     const userId = document.getElementById('userId').value.trim() || 'default_user';
     if (!confirm(`Delete ALL memories for "${userId}"? This cannot be undone.`)) return;
     try {
-      const resp = await fetch(`${API_BASE}/memories/${userId}`, { method: 'DELETE' });
+      const resp = await fetch(`${API_BASE}/memories/${encodeURIComponent(userId)}`, { method: 'DELETE' });
       if (resp.ok) {
         lastStoredId = null;
         loadMemories();

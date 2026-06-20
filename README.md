@@ -83,6 +83,10 @@ The result: an agent that gets more useful over time, not less.
 - `0.3–0.6` → expires in 7 days
 - `< 0.3` → expires in 24 hours (greetings, filler)
 
+The scoring prompt is explicitly calibrated against two failure modes found during testing:
+- **Specific beats vague** — a named, concrete fact (e.g. "grows cherry tomatoes and basil") must score at least as high as the general category it belongs to (e.g. "is an indoor gardener"). Without this rule, vague statements were outscoring the specific facts that actually make recall useful.
+- **Names have a floor** — a person's own name is treated as a 0.6+ identity fact, never scored as casual/trivial, so it can't accidentally expire within a day of being mentioned.
+
 **Importance-first recall** — pgvector cosine similarity, ranked `ORDER BY importance_score DESC, similarity DESC`. This guarantees a user's core profile facts (name, project, deadlines) surface on the very first turn of a new session, even before enough conversation exists for a strong semantic match.
 
 **Weighted duplicate/conflict detection** — before storing, candidate memories are ranked by a blended score (`60% similarity + 40% importance`) and checked against the new content:
@@ -97,6 +101,8 @@ The result: an agent that gets more useful over time, not less.
 
 **Smart forget** — memories with `expires_at` in the past (low/medium importance only — permanent memories with `expires_at = NULL` are never touched) are batch-reviewed via `DELETE /forget`. For each candidate, Qwen weighs the content, its original importance score, and its age, then votes `DELETE` or `KEEP`. Deleted memories are hard-removed from Neon and purged from the Redis cache; kept memories get their TTL renewed by 7 days rather than being re-flagged every cycle.
 
+**Prompt injection hardening** — since stored memories get re-injected into the system prompt of *future*, unrelated sessions, a malicious message stored as a "memory" could otherwise function as a persistent, cross-session jailbreak. Both the system prompt (recall) and the extraction prompt (storage) explicitly frame all user/memory content as untrusted data to read, never instructions to follow — including text that impersonates system/admin commands. The conflict-arbitration prompt has the same framing, so a crafted memory can't manipulate the UPDATE/NEW verdict into overwriting unrelated memories. This is prompt-level defense-in-depth, not a hard guarantee — LLM-based defenses reduce but don't eliminate injection risk.
+
 ---
 
 ## Project Structure
@@ -106,8 +112,9 @@ qwen-memory-agent/
 ├── memory_api.py        # Core memory CRUD, scoring, recall, forget
 ├── agent.py             # Chat layer — memory injection + extraction
 ├── seed_memories.py     # Test data seeder
+├── test_memory_agent.py # End-to-end test suite (API + frontend file validation)
 ├── frontend/
-│   └── index.html       # Chat UI + live memory panel
+│   └── index.html       # Chat UI + live memory panel + intro/how-to-use guide
 ├── .env.example
 ├── requirements.txt
 └── README.md
@@ -201,10 +208,12 @@ Open `http://localhost:8001/app` after starting `agent.py`.
 
 - **Chat panel** — standard chat, with badges showing how many memories were recalled and whether the turn was stored
 - **Memory panel** — live view of all stored memories, sorted by importance score, with color-coded TTL bars
+- **🧹 Smart Forget button** — manually triggers a review of expired memories for the current user via `DELETE /forget/{user_id}`, and shows the reviewed/deleted/kept counts inline
 - **New Session** — starts a fresh session ID while keeping all memories intact (tests cross-session recall)
 - **Clear Chat** — wipes the UI conversation history, memory unaffected
 - **🗑 per-card delete** — remove individual memories
 - **✕ Clear All** — nuke all memories for the current user ID
+- **"How this works" intro panel** — shown on first load, walks new users/judges through what the app does and a step-by-step script to test cross-session recall in under a minute. Dismissible via the close button, reopenable via the header link.
 
 ---
 
@@ -214,6 +223,22 @@ Open `http://localhost:8001/app` after starting `agent.py`.
 2. Click **New Session** (or restart the server entirely)
 3. Ask the agent something related — it will recall and reference what you told it
 4. The memory panel shows which memories were injected into that response
+
+---
+
+## Testing
+
+`test_memory_agent.py` is a real end-to-end suite — it makes live HTTP calls against a running instance (local or deployed) rather than mocking anything, so a passing run is genuine proof the system behaves as documented.
+
+```bash
+# against local servers (memory_api.py on :8000, agent.py on :8001)
+python test_memory_agent.py
+
+# against the live Alibaba Cloud deployment
+python test_memory_agent.py --remote <ECS-public-IP>
+```
+
+Covers: health checks, store/recall, importance scoring calibration (including the specific-vs-vague and name-floor rules above), deduplication and conflict arbitration, negative-fact filtering, cross-session recall, smart forget, manual delete, and a structural validation pass over `frontend/index.html` (catches regressions like a hardcoded `API_BASE` or a leaked default user ID before they reach a live deployment).
 
 ---
 

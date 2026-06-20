@@ -2,6 +2,8 @@
 
 System architecture for Qwen MemoryAgent — Track 1: MemoryAgent, Global AI Hackathon with Qwen Cloud.
 
+**The hardest problem here wasn't storing memories — it was knowing when a new memory should overwrite an old one instead of duplicating it.** If a user says "I prefer Python" today and "I've switched to Rust" next week, a naive system either ends up with two contradictory facts forever, or blindly overwrites things that were actually meant to coexist. The conflict-arbitration system below (`manage_duplicates_and_conflicts` in `memory_api.py`) is the answer to that, and it's the part of this project worth looking at most closely.
+
 ## Diagram
 
 ```mermaid
@@ -28,11 +30,14 @@ graph TB
     Frontend -->|POST /chat| Agent
     Frontend -->|GET /chat/memories/user_id| Agent
     Frontend -->|DELETE /memory/id| Agent
+    Frontend -->|DELETE /memories/user_id<br/>Clear All| Agent
+    Frontend -->|DELETE /forget/user_id<br/>Smart Forget button| Agent
 
     Agent -->|POST /recall| MemoryAPI
     Agent -->|POST /memory| MemoryAPI
     Agent -->|GET /memories/user_id| MemoryAPI
-    Agent -->|proxy DELETE| MemoryAPI
+    Agent -->|DELETE /memory/id<br/>DELETE /memories/user_id| MemoryAPI
+    Agent -->|DELETE /forget<br/>proxy| MemoryAPI
     Agent -->|chat completion<br/>extract memories| QwenChat
 
     MemoryAPI -->|score importance<br/>synthesize context| QwenChat
@@ -146,7 +151,8 @@ flowchart LR
 | **Qwen Cloud (text-embedding-v3)** | 1024-dimension embeddings for semantic search and duplicate detection |
 | **Neon PostgreSQL + pgvector** | Persistent storage for memories and their vector embeddings; cosine similarity search |
 | **Upstash Redis** | Short-term cache (1hr TTL) for recently stored memories |
-| **Alibaba Cloud ECS** | Hosts both backend services (`memory_api.py`, `agent.py`) — see [`DEPLOYMENT.md`](./DEPLOYMENT.md) |
+| **Alibaba Cloud ECS** | Hosts both backend services (`memory_api.py`, `agent.py`) — see [`Deployment.md`](./Deployment.md) |
+| **test_memory_agent.py** | End-to-end test suite — makes live HTTP calls against either deployment to verify every behavior in this document, plus a structural validation pass over `frontend/index.html` |
 
 ## Why This Design
 
@@ -157,3 +163,17 @@ flowchart LR
 **Two-step memory write (extract, then store)** — instead of storing the raw user message, `agent.py` asks Qwen to extract structured facts first. This produces cleaner, more reusable memories ("User prefers concise explanations") instead of noisy raw text ("yeah I guess I'd rather you keep it short tbh").
 
 **Deduplication and conflict resolution at write time** — rather than blind dedup, candidate memories are ranked by a blended similarity+importance score and Qwen arbitrates whether a close match should be treated as a duplicate (reject), an update (overwrite the stale fact), or a genuinely new independent memory. This handles the common case where a user's stated preference changes over time ("I prefer Python" → "actually I've switched to Rust") without leaving stale, contradictory memories in the store.
+
+**Memory content is framed as data, never instructions** — because stored memories get re-injected into the system prompt of *future*, unrelated sessions, a malicious message stored as a "memory" could otherwise act as a persistent, cross-session jailbreak. The recall system prompt, the extraction prompt, and the conflict-arbitration prompt all explicitly tell Qwen that memory/user content is untrusted data to read, never instructions to obey — including text that impersonates system or admin commands. This is prompt-level defense-in-depth: it meaningfully reduces injection risk but, like any LLM-based defense, isn't a hard guarantee against a sufficiently adversarial input.
+
+## Known Limitations
+
+These are deliberate scope decisions for a hackathon timeline, not oversights — named here so they're explicit rather than discovered by a reader.
+
+**User ID is a plain text field, not authentication.** Anyone who knows or guesses a user ID can read and write that user's memories. This is intentional for fast demo/testing (typing a name should be instant, not gated behind signup), but a production version would need real auth before this could hold anyone's actual personal data.
+
+**Conflict arbitration is a single Qwen call, not a transaction.** Between reading the top-3 candidates and writing the resolved row, a concurrent write to the same user's memories could theoretically race. At hackathon scale (one user testing at a time) this never surfaces; at production scale it would need a database-level lock or optimistic concurrency check.
+
+**Importance scoring is a single LLM call per memory, not a learned model.** It's fast to build and genuinely effective (see the calibration rules above), but it means scoring is only as consistent as Qwen's adherence to the prompt — occasional miscalibration is possible and was in fact found and corrected once during testing (see the specific-vs-vague and name-floor rules).
+
+**Smart Forget runs synchronously per request, not on a schedule.** It only reviews memories when `/forget` is explicitly called (via the UI button or API), not automatically in the background. A production system would likely run this as a periodic job instead of a manual trigger.
