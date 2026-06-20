@@ -162,9 +162,22 @@ async def score_importance(content: str) -> float:
     """Asks Qwen to assign an analytical importance weight score between 0.0 and 1.0."""
     try:
         prompt = f"""Rate the long-term importance of this user memory statement on a scale from 0.00 to 1.00.
+
 0.0 = completely trivial greeting or boilerplate conversation ("Hello", "Goodbye").
-0.5 = minor context ("User prefers Python over JavaScript").
-1.0 = absolute core profile defining trait, critical project detail, or deadline constraint.
+0.3 = minor situational context likely to change soon ("User has one hour before bed tonight").
+0.5 = general stable preference stated without specifics ("User likes gardening", "User prefers Python").
+0.7 = a SPECIFIC, NAMED personal fact, identity detail, or named project/tool — even if it sounds minor.
+      Specific beats vague: a named hobby detail outranks a vague category statement about the same topic.
+      Examples: a person's own name, a named hobby item ("grows cherry tomatoes and basil"),
+      a named tool/stack choice, a job title, a named project.
+1.0 = an absolute core profile-defining trait, critical project detail, or hard deadline/constraint.
+
+Calibration rule: do NOT score a vague category statement (e.g. "User is an indoor gardener") higher
+than a specific, named instance of that same category (e.g. "User grows cherry tomatoes and basil").
+The specific, named fact is what makes recall useful later, so it should score AT LEAST as high as
+the general statement it belongs to — never lower.
+
+A person's own name should never score below 0.6, even if it appears in a casual or offhand way.
 
 Statement: "{content}"
 Return only a floating point value."""
@@ -342,6 +355,98 @@ async def recall_memories(request: RecallRequest):
     except Exception as e:
         logger.error(f"Recall engine error: {e}")
         return RecallResponse(context_window="", memories=[])
+
+
+class ForgetRequest(BaseModel):
+    user_id: str
+    batch_size: int = 20
+
+
+class ForgetResponse(BaseModel):
+    reviewed: int
+    deleted: int
+    kept: int
+    deleted_ids: List[str]
+
+
+async def qwen_should_forget(content: str, importance_score: float, created_at: datetime) -> bool:
+    """Asks Qwen to make the final keep/delete call on an already-expired, low-importance memory."""
+    try:
+        age_days = (datetime.utcnow() - created_at).days
+        prompt = f"""This memory has already passed its expiration window and is a candidate for deletion.
+
+Memory: "{content}"
+Importance score when stored: {importance_score:.2f}
+Age: {age_days} day(s)
+
+Most expired low-importance memories (greetings, filler, one-off small talk) should be deleted.
+Only vote to keep if this still holds genuinely useful edge-case context despite being low-importance
+(e.g. a niche preference or fact that could still matter later, even if rarely).
+
+Reply with exactly one word: DELETE or KEEP."""
+
+        resp = await qwen.chat.completions.create(
+            model="qwen-plus",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=5,
+            extra_body={"enable_thinking": False}
+        )
+        verdict = resp.choices[0].message.content.strip().upper()
+        return "DELETE" in verdict
+    except Exception as e:
+        logger.error(f"[Smart Forget] Qwen arbitration failed, defaulting to KEEP: {e}")
+        return False
+
+
+@app.delete("/forget", response_model=ForgetResponse)
+async def smart_forget(request: ForgetRequest):
+    """
+    Smart forgetting — reviews memories that are already past their expires_at TTL
+    and asks Qwen to make a final keep/delete call on each, rather than blind TTL deletion.
+    Memories with expires_at = NULL (permanent, importance >= 0.6) are never candidates.
+    """
+    async with db.pool.acquire() as conn:
+        candidates = await conn.fetch("""
+            SELECT id, content, importance_score, created_at
+            FROM memories
+            WHERE user_id = $1
+              AND expires_at IS NOT NULL
+              AND expires_at <= NOW()
+            ORDER BY expires_at ASC
+            LIMIT $2
+        """, request.user_id, request.batch_size)
+
+    deleted_ids: List[str] = []
+    kept = 0
+
+    for row in candidates:
+        should_delete = await qwen_should_forget(
+            row['content'], float(row['importance_score']), row['created_at']
+        )
+        if should_delete:
+            async with db.pool.acquire() as conn:
+                await conn.execute("DELETE FROM memories WHERE id = $1", row['id'])
+            if db.redis:
+                await db.redis.delete(f"memory:{row['id']}")
+            deleted_ids.append(str(row['id']))
+            logger.info(f"[Smart Forget] Deleted expired memory {row['id']}: {row['content'][:60]}")
+        else:
+            # Qwen voted to keep it despite expiry — extend TTL by 7 days rather than
+            # leaving it permanently overdue for re-review
+            async with db.pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE memories SET expires_at = $1 WHERE id = $2",
+                    datetime.utcnow() + timedelta(days=7), row['id']
+                )
+            kept += 1
+            logger.info(f"[Smart Forget] Kept and renewed memory {row['id']}: {row['content'][:60]}")
+
+    return ForgetResponse(
+        reviewed=len(candidates),
+        deleted=len(deleted_ids),
+        kept=kept,
+        deleted_ids=deleted_ids
+    )
 
 
 @app.get("/memories/{user_id}")

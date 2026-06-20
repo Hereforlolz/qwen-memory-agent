@@ -252,6 +252,15 @@
     font-size: 12px;
     line-height: 1.8;
   }
+  .forget-status {
+    padding: 8px 16px 12px;
+    font-size: 11px;
+    color: #6b6b8a;
+    text-align: center;
+    flex-shrink: 0;
+    min-height: 0;
+  }
+  .forget-status.visible { color: #fbbf24; }
   .delete-btn {
   background: none;
   border: none;
@@ -302,12 +311,14 @@
       <h2>Stored Memories</h2>
       <div style="display:flex;gap:6px;">
         <button class="refresh-btn" onclick="loadMemories()">↻ Refresh</button>
+        <button class="refresh-btn" style="color:#fbbf24;border-color:#78350f;" onclick="smartForget()">🧹 Smart Forget</button>
         <button class="refresh-btn" style="color:#f87171;border-color:#4c1d2e;" onclick="clearAllMemories()">✕ Clear All</button>
     </div>
   </div>
     <div class="memory-list" id="memoryList">
       <div class="empty-state">No memories yet.<br>Start chatting to build memory.</div>
     </div>
+    <div class="forget-status" id="forgetStatus"></div>
   </div>
 </div>
 
@@ -503,6 +514,28 @@
       if (resp.ok) loadMemories();
     } catch (err) {
       console.error('Delete failed:', err);
+    }
+  }
+
+  async function smartForget() {
+    const userId = document.getElementById('userId').value.trim() || 'default_user';
+    const statusEl = document.getElementById('forgetStatus');
+    statusEl.textContent = 'Reviewing expired memories…';
+    statusEl.className = 'forget-status visible';
+    try {
+      const resp = await fetch(`${API_BASE}/forget/${userId}?batch_size=20`, { method: 'DELETE' });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      const { reviewed = 0, deleted = 0, kept = 0 } = data;
+      statusEl.textContent = reviewed === 0
+        ? 'No expired memories to review right now.'
+        : `Reviewed ${reviewed} · deleted ${deleted} · kept ${kept}`;
+      loadMemories();
+    } catch (err) {
+      statusEl.textContent = `⚠️ Smart forget failed: ${err.message}`;
+      console.error('Smart forget failed:', err);
+    } finally {
+      setTimeout(() => { statusEl.className = 'forget-status'; }, 6000);
     }
   }
 

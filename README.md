@@ -95,7 +95,7 @@ The result: an agent that gets more useful over time, not less.
 
 **Smart extraction** — after each turn, a second Qwen call extracts structured facts from the conversation (up to 3 per turn) rather than storing raw message text.
 
-**Smart forget** — Qwen reviews low-importance expired memories and decides delete vs keep, preventing both memory bloat and accidental loss of edge-case useful context.
+**Smart forget** — memories with `expires_at` in the past (low/medium importance only — permanent memories with `expires_at = NULL` are never touched) are batch-reviewed via `DELETE /forget`. For each candidate, Qwen weighs the content, its original importance score, and its age, then votes `DELETE` or `KEEP`. Deleted memories are hard-removed from Neon and purged from the Redis cache; kept memories get their TTL renewed by 7 days rather than being re-flagged every cycle.
 
 ---
 
@@ -181,7 +181,7 @@ python seed_memories.py
 | GET | `/memories/{user_id}` | List all memories, sorted by importance |
 | DELETE | `/memory/{memory_id}` | Hard delete a single memory |
 | DELETE | `/memories/{user_id}` | Delete all memories for a user |
-| DELETE | `/forget` | Trigger Qwen-powered smart forget |
+| DELETE | `/forget` | Qwen-arbitrated smart forget — reviews expired, low-importance memories and deletes or renews each (body: `{user_id, batch_size}`) |
 | GET | `/health` | Health check (DB + Redis ping) |
 
 ### agent.py (port 8001)
@@ -190,6 +190,7 @@ python seed_memories.py
 |---|---|---|
 | POST | `/chat` | Full memory-injected chat turn — returns `memories_stored: list[dict]` |
 | GET | `/chat/memories/{user_id}` | Memory panel data for frontend |
+| DELETE | `/forget/{user_id}` | Proxies to memory_api.py's smart forget |
 | GET | `/health` | Health check |
 
 ---

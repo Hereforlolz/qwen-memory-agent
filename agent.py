@@ -261,6 +261,22 @@ async def delete_all_memories_proxy(user_id: str):
         return resp.json()
 
 
+@app.delete("/forget/{user_id}")
+async def smart_forget_proxy(user_id: str, batch_size: int = 20):
+    """Proxies to memory_api.py's Qwen-arbitrated smart forget for expired, low-importance memories."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            resp = await client.request(
+                "DELETE",
+                f"{MEMORY_API_URL}/forget",
+                json={"user_id": user_id, "batch_size": batch_size},
+            )
+            return resp.json()
+        except Exception as e:
+            print(f"[ERROR] Smart forget proxy failed: {e}")
+            raise HTTPException(status_code=502, detail="Smart forget service unreachable")
+
+
 # ── serve frontend ────────────────────────────────────────────────────────────
 
 frontend_path = os.path.join(os.path.dirname(__file__), "frontend")

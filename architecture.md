@@ -128,10 +128,11 @@ flowchart LR
     G --> M
     M --> N[Cached in Redis<br/>1hr TTL]
 
-    O[Smart Forget<br/>triggered] --> P[Fetch expired<br/>low-importance memories]
-    P --> Q[Qwen reviews:<br/>delete or keep?]
-    Q -->|delete| R[Removed from Neon]
-    Q -->|keep| M
+    O[DELETE /forget<br/>user_id, batch_size] --> P[Fetch up to batch_size memories<br/>WHERE expires_at IS NOT NULL<br/>AND expires_at <= NOW]
+    P --> Q{For each candidate,<br/>Qwen reviews:<br/>content + importance + age}
+    Q -->|DELETE| R[Hard delete from Neon<br/>+ purge Redis cache entry]
+    Q -->|KEEP| S[Renew expires_at<br/>+7 days from now]
+    S --> M
 ```
 
 ## Component Responsibilities
