@@ -40,7 +40,7 @@ graph TB
     Agent -->|DELETE /forget<br/>proxy| MemoryAPI
     Agent -->|chat completion<br/>extract memories| QwenChat
 
-    MemoryAPI -->|score importance<br/>synthesize context| QwenChat
+    MemoryAPI -->|score importance<br/>arbitrate conflicts| QwenChat
     MemoryAPI -->|generate embeddings| QwenEmbed
     MemoryAPI -->|store/query vectors| Neon
     MemoryAPI -->|cache 1hr TTL| Redis

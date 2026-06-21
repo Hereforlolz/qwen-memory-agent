@@ -2,7 +2,7 @@
 
 **Track 1: MemoryAgent — Global AI Hackathon with Qwen Cloud**
 
-A persistent memory layer where Qwen actively scores, recalls, synthesizes, and forgets memories across sessions. Unlike stateless chat, MemoryAgent remembers what users tell it — preferences, goals, project details, personal context — and injects that memory into every response, even days later.
+A persistent memory layer where Qwen actively scores, recalls, and forgets memories across sessions. Unlike stateless chat, MemoryAgent remembers what users tell it — preferences, goals, project details, personal context — and injects that memory into every response, even days later.
 
 ---
 
@@ -13,7 +13,7 @@ Most AI chat is stateless. Every session starts from zero. MemoryAgent fixes tha
 Every conversation turn runs through a full memory pipeline:
 
 1. **Recall** — semantic search finds relevant past memories for the current query
-2. **Synthesize** — Qwen builds a context window from recalled memories before responding
+2. **Retrieve** — recalled memories are formatted into a context block ordered by importance and relevance
 3. **Extract** — after responding, Qwen extracts key facts from the turn as structured memories
 4. **Score** — each memory gets an importance score (0.0–1.0) from Qwen
 5. **TTL** — low-importance memories expire in 24h, medium in 7 days, high-importance are permanent
@@ -95,7 +95,7 @@ The scoring prompt is explicitly calibrated against two failure modes found duri
 
 **Negative-fact filtering** — the extraction prompt explicitly forbids generating memories from absence-of-information statements (e.g. "user doesn't have a car"), preventing the memory store from filling with noise.
 
-**Context synthesis** — recalled memories aren't dumped raw into the prompt. Qwen synthesizes them into a concise context paragraph tuned to the current query.
+**Structured context retrieval** — recalled memories aren't dumped into the prompt as raw rows; they're formatted into a clean, dated bullet list ordered by importance and relevance before being injected into the system prompt.
 
 **Smart extraction** — after each turn, a second Qwen call extracts structured facts from the conversation (up to 3 per turn) rather than storing raw message text.
 
