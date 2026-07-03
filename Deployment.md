@@ -13,6 +13,11 @@ This file documents the live deployment of Qwen MemoryAgent on Alibaba Cloud inf
 | Billing | Pay-as-you-go |
 | Instance ID | `i-rj9fpf5zw40qz7c306t0` |
 
+## Proof of Deployment
+![ECS Instance Running](./alibaba_Ecs_instance.png)
+
+Instance `i-rj9fpf5zw40qz7c306t0` shown live in the Alibaba Cloud ECS console, status: Running, public IP `47.89.246.67`, US (Silicon Valley) region.
+
 ## Services Running
 
 Both backend services run directly on the ECS instance via `nohup` + `uvicorn`:
@@ -60,12 +65,10 @@ Response (truncated):
 ```
 
 ## Security Group Configuration
-
 Inbound rules opened on the ECS security group to allow external access:
-
 | Port | Protocol | Source | Purpose |
 |---|---|---|---|
-| 22 | TCP | 0.0.0.0/0 | SSH management |
+| 22 | TCP | 24.216.78.74/32 (developer IP) | SSH management |
 | 8000 | TCP | 0.0.0.0/0 | memory_api.py |
 | 8001 | TCP | 0.0.0.0/0 | agent.py + frontend |
 
