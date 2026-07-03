@@ -250,6 +250,8 @@ Covers: health checks, store/recall, importance scoring calibration (including t
 - [Alibaba Cloud ECS](https://www.alibabacloud.com) — deployment
 
 ---
+##Link to demo
+DEMO: https://vimeo.com/1204609875?fl=tl&fe=ec
 
 ## License
 
