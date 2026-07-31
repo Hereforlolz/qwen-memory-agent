@@ -26,18 +26,21 @@ graph TB
         Redis[("Upstash Redis<br/>1hr cache")]
     end
 
-    User -->|HTTP| Frontend
+    User -->|HTTP, Bearer token| Frontend
+    Frontend -->|POST /auth/register<br/>POST /auth/login| Agent
     Frontend -->|POST /chat| Agent
-    Frontend -->|GET /chat/memories/user_id| Agent
+    Frontend -->|GET /chat/memories| Agent
     Frontend -->|DELETE /memory/id| Agent
-    Frontend -->|DELETE /memories/user_id<br/>Clear All| Agent
-    Frontend -->|DELETE /forget/user_id<br/>Smart Forget button| Agent
+    Frontend -->|DELETE /memories<br/>Clear All| Agent
+    Frontend -->|DELETE /forget<br/>Smart Forget button| Agent
 
+    Agent -->|proxied, Bearer token forwarded| MemoryAPI
     Agent -->|POST /recall| MemoryAPI
     Agent -->|POST /memory| MemoryAPI
-    Agent -->|GET /memories/user_id| MemoryAPI
-    Agent -->|DELETE /memory/id<br/>DELETE /memories/user_id| MemoryAPI
+    Agent -->|GET /memories| MemoryAPI
+    Agent -->|DELETE /memory/id<br/>DELETE /memories| MemoryAPI
     Agent -->|DELETE /forget<br/>proxy| MemoryAPI
+    Agent -->|POST /auth/register<br/>POST /auth/login, proxy| MemoryAPI
     Agent -->|chat completion<br/>extract memories| QwenChat
 
     MemoryAPI -->|score importance<br/>arbitrate conflicts| QwenChat
@@ -147,9 +150,9 @@ flowchart LR
 
 | Component | Responsibility |
 |---|---|
-| **frontend/index.html** | Chat UI, live memory panel, session management, delete controls |
-| **agent.py** | Orchestrates chat turns: recall → prompt assembly → Qwen call, returning the reply immediately; memory extraction → storage runs afterward as a background task. Proxies delete requests. |
-| **memory_api.py** | Owns all memory intelligence: importance scoring, embedding generation, semantic recall, context synthesis, deduplication, smart forgetting, CRUD |
+| **frontend/index.html** | Login/register UI, chat UI, live memory panel, session management, delete controls |
+| **agent.py** | Orchestrates chat turns: recall → prompt assembly → Qwen call, returning the reply immediately; memory extraction → storage runs afterward as a background task. Proxies delete and auth requests. Independently verifies the same JWTs memory_api.py issues. |
+| **memory_api.py** | Owns all memory intelligence: importance scoring, embedding generation, semantic recall, context synthesis, deduplication, smart forgetting, CRUD. Also owns user accounts: registration, login, password hashing, JWT issuance. |
 | **Qwen Cloud (qwen-plus)** | Chat completions for: user-facing replies, importance scoring, context synthesis, memory extraction |
 | **Qwen Cloud (text-embedding-v3)** | 1024-dimension embeddings for semantic search and duplicate detection |
 | **Neon PostgreSQL + pgvector** | Persistent storage for memories and their vector embeddings; cosine similarity search |
@@ -175,7 +178,19 @@ flowchart LR
 
 These are deliberate scope decisions for a hackathon timeline, not oversights — named here so they're explicit rather than discovered by a reader.
 
-**User ID is a plain text field, not authentication.** Anyone who knows or guesses a user ID can read and write that user's memories. This is intentional for fast demo/testing (typing a name should be instant, not gated behind signup), but a production version would need real auth before this could hold anyone's actual personal data.
+~~**User ID is a plain text field, not authentication.**~~ Fixed: both services now require a JWT (`POST /auth/register` / `POST /auth/login`, username + bcrypt-hashed password) on every memory-scoped endpoint. `user_id` is fully removed from request bodies and URL paths — identity comes only from the verified token, via `Depends(get_current_user)` — not just cross-checked against a client-supplied value. `memory_api.py` owns the `users` table and issues tokens; `agent.py` verifies the same tokens independently (shared `JWT_SECRET`, decode-only, no bcrypt/no users table) rather than trusting `memory_api.py`'s verification alone, since `memory_api.py`'s port is also directly publicly reachable. CORS also switched from `allow_origins=["*"]` to a configurable `ALLOWED_ORIGINS` env var.
+
+New limitations that come with this fix, named the same way the ones above are:
+
+**Pre-existing demo data has no ownership continuity.** Memories stored under a given `user_id` string before this change was deployed were never password-protected. The first person to register that exact username afterward gets access to whatever was already stored under it — there's no way to verify "is this legitimately the same person" against data that predates accounts existing at all. Fine for hackathon demo content, would matter for anything real.
+
+**No token revocation or refresh.** Tokens are just short-lived (`JWT_EXPIRE_HOURS`, default 24) — there's no server-side blacklist, so a compromised token remains valid until it naturally expires. Logout is client-side only (clearing the stored token); it doesn't invalidate the token itself.
+
+**No rate limiting on `/auth/login` or `/auth/register`.** Brute-force protection is out of scope — nothing currently slows down repeated failed login attempts against a given username.
+
+**JWT stored in browser `localStorage`.** Readable by any injected script; there's no Content-Security-Policy. The frontend's existing `escapeHtml()` discipline in `appendMessage`/`renderMemories` reduces but doesn't eliminate this exposure.
+
+**`JWT_SECRET` must be provisioned identically to both services.** They verify tokens independently with a shared secret rather than one service delegating to the other — a mismatch between the two `.env` files fails every token verification with no clear error pointing at the actual cause. See `Deployment.md`.
 
 ~~**Conflict arbitration is a single Qwen call, not a transaction.**~~ Fixed: `store_memory` now takes a per-`user_id` Postgres advisory lock (`pg_advisory_xact_lock(hashtext(user_id))`) and runs the candidate read, arbitration, and final write inside one transaction, so a concurrent write for the same user can no longer land between the check and the write. Different users never contend with each other. The tradeoff: a pooled connection stays checked out for the full sequence, including the arbitration/scoring Qwen calls, so heavy concurrent write volume across many users could exhaust the connection pool (`max_size=10`) faster than before.
 

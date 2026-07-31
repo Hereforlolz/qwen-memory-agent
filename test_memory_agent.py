@@ -42,6 +42,12 @@ BASE_AGENT = f"http://{HOST}:{args.agent_port}"
 
 # Fresh test user every run so results don't get polluted by prior test data
 TEST_USER = f"test_{uuid.uuid4().hex[:8]}"
+TEST_PASSWORD = "TestPassword123!"
+
+# Populated by register_test_user() before any other test runs. Every request
+# after that carries this as an Authorization header instead of a user_id in
+# the body/path — identity is derived from the token now, not client input.
+TOKEN = None
 
 PASS = "\033[92mPASS\033[0m"
 FAIL = "\033[91mFAIL\033[0m"
@@ -114,6 +120,29 @@ def poll_until_stable(fetch_fn, timeout=8.0, interval=0.5):
     return previous
 
 
+def auth_headers():
+    return {"Authorization": f"Bearer {TOKEN}"}
+
+
+# ── 0. Register the test user ────────────────────────────────────────────────
+
+def register_test_user():
+    """Registers TEST_USER via agent.py's /auth/register proxy (rather than
+    calling memory_api.py directly) so this proxy code path gets exercised
+    too. Every other test function depends on TOKEN being set here first."""
+    global TOKEN
+    section("0. Register Test User")
+    r = safe_request("POST", f"{BASE_AGENT}/auth/register", json={
+        "username": TEST_USER,
+        "password": TEST_PASSWORD,
+    }, timeout=15)
+    ok = check("POST /auth/register (via agent.py proxy) returns 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+    if ok:
+        data = r.json()
+        check("response includes access_token", bool(data.get("access_token")), str(data))
+        TOKEN = data.get("access_token")
+
+
 # ── 1. Health checks ─────────────────────────────────────────────────────────
 
 def test_health():
@@ -142,10 +171,9 @@ def test_basic_store_and_recall():
     session_id = str(uuid.uuid4())
 
     r = safe_request("POST", f"{BASE_MEMORY}/memory", json={
-        "user_id": TEST_USER,
         "session_id": session_id,
         "content": "User's favorite programming language is Rust",
-    }, timeout=15)
+    }, headers=auth_headers(), timeout=15)
     check("POST /memory returns 200 for a fresh fact", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
 
     if r.status_code == 200:
@@ -158,10 +186,9 @@ def test_basic_store_and_recall():
 
     def do_recall():
         return safe_request("POST", f"{BASE_MEMORY}/recall", json={
-            "user_id": TEST_USER,
             "query": "what programming language do I like",
             "top_k": 5,
-        }, timeout=15)
+        }, headers=auth_headers(), timeout=15)
 
     def found_rust(resp):
         return resp.status_code == 200 and any(
@@ -198,10 +225,9 @@ def test_importance_calibration():
     scores = {}
     for content, label, _, _ in cases:
         r = safe_request("POST", f"{BASE_MEMORY}/memory", json={
-            "user_id": TEST_USER,
             "session_id": session_id,
             "content": content,
-        }, timeout=15)
+        }, headers=auth_headers(), timeout=15)
         if r.status_code == 200:
             scores[label] = r.json()["importance_score"]
         elif r.status_code == 409:
@@ -236,19 +262,17 @@ def test_dedup_and_conflicts():
 
     # Store an initial fact
     r1 = safe_request("POST", f"{BASE_MEMORY}/memory", json={
-        "user_id": TEST_USER,
         "session_id": session_id,
         "content": "User prefers Python for backend development",
-    }, timeout=15)
+    }, headers=auth_headers(), timeout=15)
     check("initial fact stores successfully", r1.status_code == 200, f"got {r1.status_code}")
     time.sleep(1)
 
     # Exact duplicate -> should be rejected with 409
     r2 = safe_request("POST", f"{BASE_MEMORY}/memory", json={
-        "user_id": TEST_USER,
         "session_id": session_id,
         "content": "User prefers Python for backend development",
-    }, timeout=15)
+    }, headers=auth_headers(), timeout=15)
     check("exact duplicate returns 409", r2.status_code == 409, f"got {r2.status_code}")
     time.sleep(1)
 
@@ -256,10 +280,9 @@ def test_dedup_and_conflicts():
     # NOTE: phrased to avoid containing both "python" and "backend" itself, which would
     # cause this test's own substring check to false-positive against the new row.
     r3 = safe_request("POST", f"{BASE_MEMORY}/memory", json={
-        "user_id": TEST_USER,
         "session_id": session_id,
         "content": "User has switched their backend stack to Rust",
-    }, timeout=15)
+    }, headers=auth_headers(), timeout=15)
     check("contradicting fact is accepted (not blind-rejected)", r3.status_code == 200, f"got {r3.status_code}")
 
     # Precise check, independent of wording: if conflict arbitration triggered UPDATE,
@@ -282,14 +305,14 @@ def test_dedup_and_conflicts():
     # Poll until the memory list stops changing instead of a blind sleep,
     # so the duplicate count below is taken from a settled snapshot.
     def snapshot_ids():
-        r = safe_request("GET", f"{BASE_MEMORY}/memories/{TEST_USER}", timeout=15)
+        r = safe_request("GET", f"{BASE_MEMORY}/memories", headers=auth_headers(), timeout=15)
         if r.status_code != 200:
             return None
         return tuple(sorted(m["id"] for m in r.json()))
 
     poll_until_stable(snapshot_ids)
 
-    r4 = safe_request("GET", f"{BASE_MEMORY}/memories/{TEST_USER}", timeout=15)
+    r4 = safe_request("GET", f"{BASE_MEMORY}/memories", headers=auth_headers(), timeout=15)
     if r4.status_code == 200:
         contents = [m["content"].lower() for m in r4.json()]
         # Only count rows that assert Python as the current backend preference —
@@ -315,25 +338,24 @@ def test_negative_fact_filtering():
     session_id = str(uuid.uuid4())
 
     r = safe_request("POST", f"{BASE_AGENT}/chat", json={
-        "user_id": TEST_USER,
         "session_id": session_id,
         "message": "Just so you know, I don't own a car and I've never been to Japan.",
         "conversation_history": [],
-    }, timeout=30)
+    }, headers=auth_headers(), timeout=30)
     check("chat turn with negative facts completes", r.status_code == 200, f"got {r.status_code}")
 
     # We're checking for the *absence* of something, so there's no positive
     # condition to poll for — instead wait for the memory list to stop
     # changing (no more async writes landing) before taking the snapshot.
     def snapshot_ids():
-        r = safe_request("GET", f"{BASE_MEMORY}/memories/{TEST_USER}", timeout=15)
+        r = safe_request("GET", f"{BASE_MEMORY}/memories", headers=auth_headers(), timeout=15)
         if r.status_code != 200:
             return None
         return tuple(sorted(m["id"] for m in r.json()))
 
     poll_until_stable(snapshot_ids)
 
-    r2 = safe_request("GET", f"{BASE_MEMORY}/memories/{TEST_USER}", timeout=15)
+    r2 = safe_request("GET", f"{BASE_MEMORY}/memories", headers=auth_headers(), timeout=15)
     if r2.status_code == 200:
         contents = [m["content"].lower() for m in r2.json()]
         negative_leaks = [c for c in contents if ("doesn't" in c or "does not" in c or "never" in c or "no car" in c or "not own" in c)]
@@ -352,20 +374,20 @@ def test_cross_session_recall():
     session_b = str(uuid.uuid4())  # simulates a brand new session, same user
 
     r1 = safe_request("POST", f"{BASE_AGENT}/chat", json={
-        "user_id": TEST_USER,
         "session_id": session_a,
         "message": "My project deadline is July 9, 2026 and I'm building a memory agent for the Qwen hackathon.",
         "conversation_history": [],
-    }, timeout=30)
+    }, headers=auth_headers(), timeout=30)
     check("session A: chat turn completes", r1.status_code == 200, f"got {r1.status_code}")
 
     # Poll the memory store directly (a read, not another chat turn — so
     # retries don't burn extra Qwen chat calls) until the deadline fact from
-    # session A is actually visible. /chat only returns after storage
-    # completes today, so this resolves immediately in practice, but it
-    # keeps the test honest instead of hardcoding how long that takes.
+    # session A is actually visible. agent.py's /chat returns the reply
+    # before extraction/storage finishes (it runs as a background task), so
+    # this is the part of the test that actually needs the poll rather than
+    # just being defensive padding.
     def deadline_landed():
-        r = safe_request("GET", f"{BASE_MEMORY}/memories/{TEST_USER}", timeout=15)
+        r = safe_request("GET", f"{BASE_MEMORY}/memories", headers=auth_headers(), timeout=15)
         if r.status_code != 200:
             return False
         contents = " ".join(m["content"].lower() for m in r.json())
@@ -374,11 +396,10 @@ def test_cross_session_recall():
     poll_until(deadline_landed)
 
     r2 = safe_request("POST", f"{BASE_AGENT}/chat", json={
-        "user_id": TEST_USER,
-        "session_id": session_b,  # different session, same user_id
+        "session_id": session_b,  # different session, same user
         "message": "What's my deadline again?",
         "conversation_history": [],  # empty — simulates a fresh session with no local history
-    }, timeout=30)
+    }, headers=auth_headers(), timeout=30)
     check("session B (new session): chat turn completes", r2.status_code == 200, f"got {r2.status_code}")
 
     if r2.status_code == 200:
@@ -396,10 +417,9 @@ def test_smart_forget():
 
     # Store a trivial, low-importance fact that should get a short TTL
     r = safe_request("POST", f"{BASE_MEMORY}/memory", json={
-        "user_id": TEST_USER,
         "session_id": session_id,
         "content": "hello there",
-    }, timeout=15)
+    }, headers=auth_headers(), timeout=15)
     check("trivial fact stores", r.status_code == 200, f"got {r.status_code}")
     if r.status_code == 200:
         expires_at = r.json().get("expires_at")
@@ -407,15 +427,15 @@ def test_smart_forget():
 
     # NOTE: this memory's expires_at is likely hours/days in the future, so /forget
     # won't touch it yet. This call mainly verifies the endpoint itself works end-to-end.
-    r2 = safe_request("DELETE", f"{BASE_AGENT}/forget/{TEST_USER}", params={"batch_size": 20}, timeout=30)
-    check("DELETE /forget/{user_id} proxy responds 200", r2.status_code == 200, f"got {r2.status_code}: {r2.text[:200]}")
+    r2 = safe_request("DELETE", f"{BASE_AGENT}/forget", params={"batch_size": 20}, headers=auth_headers(), timeout=30)
+    check("DELETE /forget proxy responds 200", r2.status_code == 200, f"got {r2.status_code}: {r2.text[:200]}")
     if r2.status_code == 200:
         data = r2.json()
         check("forget response has reviewed/deleted/kept fields", all(k in data for k in ("reviewed", "deleted", "kept")), str(data))
         print(f"  [{INFO}] reviewed={data.get('reviewed')} deleted={data.get('deleted')} kept={data.get('kept')} (0/0/0 is expected unless something had already expired)")
 
     # Direct memory_api.py call too, to confirm both layers work independently
-    r3 = safe_request("DELETE", f"{BASE_MEMORY}/forget", json={"user_id": TEST_USER, "batch_size": 20}, timeout=30)
+    r3 = safe_request("DELETE", f"{BASE_MEMORY}/forget", json={"batch_size": 20}, headers=auth_headers(), timeout=30)
     check("DELETE /forget on memory_api.py directly responds 200", r3.status_code == 200, f"got {r3.status_code}")
 
 
@@ -424,21 +444,21 @@ def test_smart_forget():
 def test_manual_delete(memory_id):
     section("8. Manual Delete + Clear All")
     if memory_id:
-        r = safe_request("DELETE", f"{BASE_MEMORY}/memory/{memory_id}", timeout=15)
+        r = safe_request("DELETE", f"{BASE_MEMORY}/memory/{memory_id}", headers=auth_headers(), timeout=15)
         check("DELETE /memory/{id} removes a specific memory", r.status_code == 200, f"got {r.status_code}")
     else:
         print(f"  [{INFO}] skipped — no memory_id captured from earlier test")
 
-    r2 = safe_request("DELETE", f"{BASE_MEMORY}/memories/{TEST_USER}", timeout=15)
-    check("DELETE /memories/{user_id} clears all memories", r2.status_code == 200, f"got {r2.status_code}")
+    r2 = safe_request("DELETE", f"{BASE_MEMORY}/memories", headers=auth_headers(), timeout=15)
+    check("DELETE /memories clears all memories", r2.status_code == 200, f"got {r2.status_code}")
 
     def list_is_empty():
-        r = safe_request("GET", f"{BASE_MEMORY}/memories/{TEST_USER}", timeout=15)
+        r = safe_request("GET", f"{BASE_MEMORY}/memories", headers=auth_headers(), timeout=15)
         return r.status_code == 200 and len(r.json()) == 0
 
     poll_until(list_is_empty, timeout=5.0)
 
-    r3 = safe_request("GET", f"{BASE_MEMORY}/memories/{TEST_USER}", timeout=15)
+    r3 = safe_request("GET", f"{BASE_MEMORY}/memories", headers=auth_headers(), timeout=15)
     if r3.status_code == 200:
         check("memory list is empty after clear-all", len(r3.json()) == 0, f"{len(r3.json())} memories remain")
 
@@ -467,10 +487,12 @@ def test_frontend_file():
     kind of regressions that have actually broken this app before:
       - crypto.randomUUID() called without a fallback (fails outside HTTPS/localhost)
       - API_BASE hardcoded to localhost (breaks every fetch when deployed elsewhere)
-      - userId defaulting to a real person's name (leaks personal memory data to visitors)
-      - userId interpolated into a fetch URL without encodeURIComponent
+      - the auth form defaulting to a real username/password (leaks credentials to visitors)
+      - an authenticated endpoint called via raw fetch() instead of authFetch(),
+        silently sending no Authorization header
       - new buttons/panels referencing JS functions that don't exist (typo-class bugs)
       - basic HTML tag balance, since a stray unclosed tag can silently break layout
+      - the login/register auth screen itself going missing
     """
     section("10. Frontend File Validation (frontend/index.html)")
 
@@ -504,21 +526,31 @@ def test_frontend_file():
         "API_BASE uses window.location" if dynamic else "API_BASE still hardcoded — will break on any non-localhost deployment"
     )
 
-    # --- regression 3: userId input defaults to a real name instead of empty ---
-    leaks_default_user = bool(re.search(r'id="userId"[^>]*value="(?!")[^"]+"', content))
+    # --- regression 3: auth form defaults to a real username/password instead of empty ---
+    # (successor to the old "userId input defaults to a real name" check — identity now
+    # comes from a login form instead of a free-text field, same underlying risk)
+    leaks_default_creds = (
+        bool(re.search(r'id="authUsername"[^>]*value="(?!")[^"]+"', content))
+        or bool(re.search(r'id="authPassword"[^>]*value="(?!")[^"]+"', content))
+    )
     check(
-        "User ID field has no hardcoded personal default value",
-        not leaks_default_user,
-        "userId input defaults to empty/placeholder-only" if not leaks_default_user else "userId input still has a hardcoded value= — visitors may see your personal memory data by default"
+        "Auth form has no hardcoded default username/password",
+        not leaks_default_creds,
+        "auth inputs default to empty" if not leaks_default_creds else "authUsername/authPassword has a hardcoded value= — visitors may see a real account's credentials pre-filled"
     )
 
-    # --- regression 4: userId not URL-encoded in fetch calls ---
-    # every fetch template literal that embeds userId directly in the path should wrap it
-    unsafe_userid_urls = re.findall(r"fetch\(`\$\{API_BASE\}/[^`]*\$\{userId\}", content)
+    # --- regression 4: authenticated endpoints called via authFetch(), not raw fetch() ---
+    # (successor to the old "userId URL-encoded in fetch calls" check — identity now
+    # comes from an Authorization header via authFetch() instead of a URL segment, so
+    # the thing worth catching is a call that bypasses that wrapper entirely)
+    has_auth_fetch_fn = "async function authFetch" in content
+    raw_fetch_to_protected_endpoints = re.findall(
+        r"(?<!auth)fetch\(`\$\{API_BASE\}/(chat|memories|memory|forget)[^`]*`", content
+    )
     check(
-        "userId is URL-encoded before being inserted into fetch URLs",
-        len(unsafe_userid_urls) == 0,
-        "all userId path segments wrapped in encodeURIComponent" if not unsafe_userid_urls else f"found {len(unsafe_userid_urls)} unescaped usage(s)"
+        "authenticated endpoints are called via authFetch(), not raw fetch()",
+        has_auth_fetch_fn and len(raw_fetch_to_protected_endpoints) == 0,
+        f"authFetch() present={has_auth_fetch_fn}, raw fetch() calls to protected endpoints={raw_fetch_to_protected_endpoints}"
     )
 
     # --- regression 5: every onclick handler has a matching function definition ---
@@ -551,12 +583,26 @@ def test_frontend_file():
         "introPanel + showIntro/hideIntro all found" if has_intro else "intro panel or its JS functions are missing"
     )
 
-    # --- regression 8: smart forget button wired to the right endpoint ---
-    smart_forget_wired = bool(re.search(r"forget/\$\{encodeURIComponent\(userId\)\}", content)) and "function smartForget" in content
+    # --- regression 8: smart forget button wired to the auth-protected /forget endpoint ---
+    smart_forget_wired = bool(re.search(r"authFetch\('/forget\?batch_size=20'", content)) and "function smartForget" in content
     check(
-        "Smart Forget button calls the /forget/{userId} endpoint with encoding",
+        "Smart Forget button calls the auth-protected /forget endpoint via authFetch",
         smart_forget_wired,
-        "wired correctly" if smart_forget_wired else "Smart Forget button or its fetch call is missing/misconfigured"
+        "wired correctly" if smart_forget_wired else "Smart Forget button or its authFetch call is missing/misconfigured"
+    )
+
+    # --- regression 9: login/register UI is present (identity moved from a free-text
+    # userId field to real auth — this is the thing most likely to silently regress) ---
+    has_auth_ui = (
+        'id="authScreen"' in content
+        and "async function submitAuth" in content
+        and "function logout" in content
+        and "function toggleAuthMode" in content
+    )
+    check(
+        "login/register auth screen and its functions are present",
+        has_auth_ui,
+        "authScreen + submitAuth/logout/toggleAuthMode all found" if has_auth_ui else "auth UI or its JS functions are missing"
     )
 
 
@@ -567,14 +613,21 @@ def main():
     print(f"Test user: {TEST_USER}\n")
 
     test_health()
-    memory_id = test_basic_store_and_recall()
-    test_importance_calibration()
-    test_dedup_and_conflicts()
-    test_negative_fact_filtering()
-    test_cross_session_recall()
-    test_smart_forget()
-    test_manual_delete(memory_id)
-    test_qwen_connectivity()
+    register_test_user()
+
+    if TOKEN:
+        memory_id = test_basic_store_and_recall()
+        test_importance_calibration()
+        test_dedup_and_conflicts()
+        test_negative_fact_filtering()
+        test_cross_session_recall()
+        test_smart_forget()
+        test_manual_delete(memory_id)
+        test_qwen_connectivity()
+    else:
+        print(f"\n  [{INFO}] Skipping all auth-dependent tests — registration failed, no token to authenticate with.")
+
+    # No live instance needed for this one — runs regardless of registration outcome.
     test_frontend_file()
 
     section("SUMMARY")

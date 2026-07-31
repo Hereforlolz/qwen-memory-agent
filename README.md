@@ -35,7 +35,8 @@ The result: an agent that gets more useful over time, not less.
 ┌─────────────────────────────────────────────────────────────┐
 │                    agent.py  (port 8001)                     │
 │ POST /chat → recall → Qwen reply → bg extract/store          │
-│  GET  /chat/memories/{user_id}                               │
+│  GET  /chat/memories · POST /auth/register · /auth/login     │
+│  (all except /auth/* and /health require a Bearer token)     │
 └──────────┬──────────────────────────────┬───────────────────┘
            │ HTTP                          │ OpenAI-compat SDK
            ▼                              ▼
@@ -46,9 +47,11 @@ The result: an agent that gets more useful over time, not less.
 │  POST /memory        │      └───────────────────────────────┘
 │  POST /recall        │
 │  DELETE /memory/{id} │
-│  DELETE /memories/   │
+│  DELETE /memories    │
 │  DELETE /forget      │
-│  GET  /memories/     │
+│  GET  /memories      │
+│  POST /auth/register │
+│  POST /auth/login    │
 └──────┬───────────────┘
        │                   │
        ▼                   ▼
@@ -70,6 +73,7 @@ The result: an agent that gets more useful over time, not less.
 | Embeddings | Qwen Cloud (`text-embedding-v3`, 1024-dim) |
 | Vector DB | Neon PostgreSQL + pgvector |
 | Cache | Upstash Redis |
+| Auth | JWT (PyJWT) + bcrypt password hashing |
 | Backend | FastAPI + asyncpg |
 | Frontend | Vanilla HTML/CSS/JS |
 | Deploy | Alibaba Cloud ECS |
@@ -150,9 +154,12 @@ QWEN_EMBEDDING_MODEL=text-embedding-v3
 DATABASE_URL=postgresql://...neon.tech/neondb?sslmode=require
 REDIS_URL=rediss://default:...@...upstash.io:6379
 MEMORY_API_URL=http://localhost:8000
+JWT_SECRET=a-long-random-string
+JWT_EXPIRE_HOURS=24
+ALLOWED_ORIGINS=http://localhost:8001
 ```
 
-> **Note:** Upstash requires `rediss://` (double s) for TLS. Neon requires `?sslmode=require`.
+> **Note:** Upstash requires `rediss://` (double s) for TLS. Neon requires `?sslmode=require`. `JWT_SECRET` must be set to the **same** value in both `memory_api.py`'s and `agent.py`'s `.env` — they verify tokens independently rather than one delegating to the other, so a mismatch fails every token check.
 
 ### 3. Run
 
@@ -171,9 +178,13 @@ python agent.py
 
 ### 4. Optional — seed test memories
 
+Registers (or logs in as) `nidhi` first, then seeds a few memories under that account.
+
 ```bash
-python seed_memories.py
+SEED_USER_PASSWORD=your-choice python seed_memories.py
 ```
+
+> Omitting `SEED_USER_PASSWORD` falls back to a hardcoded demo password, with a warning — fine for local testing, not for a shared/public deployment.
 
 ---
 
@@ -181,23 +192,31 @@ python seed_memories.py
 
 ### memory_api.py (port 8000)
 
+Every endpoint below except `/auth/*` and `/health` requires `Authorization: Bearer <token>`. There's no `user_id` in any request body or path anymore — identity comes from the token alone.
+
 | Method | Endpoint | Description |
 |---|---|---|
+| POST | `/auth/register` | Create an account (username + password) — returns `{access_token, token_type, username}` |
+| POST | `/auth/login` | Authenticate an existing account — same response shape |
 | POST | `/memory` | Store a memory — Qwen scores + embeds |
 | POST | `/recall` | Semantic search + context synthesis |
-| GET | `/memories/{user_id}` | List all memories, sorted by importance |
-| DELETE | `/memory/{memory_id}` | Hard delete a single memory |
-| DELETE | `/memories/{user_id}` | Delete all memories for a user |
-| DELETE | `/forget` | Qwen-arbitrated smart forget — reviews expired, low-importance memories and deletes or renews each (body: `{user_id, batch_size}`) |
+| GET | `/memories` | List the authenticated user's memories, sorted by importance |
+| DELETE | `/memory/{memory_id}` | Hard delete a single memory — scoped to rows the authenticated user owns |
+| DELETE | `/memories` | Delete all of the authenticated user's memories |
+| DELETE | `/forget` | Qwen-arbitrated smart forget — reviews expired, low-importance memories and deletes or renews each (body: `{batch_size}`) |
 | GET | `/health` | Health check — DB must be reachable; Redis is reported (`redis: "ok"/"unreachable"/"disabled"`) but never fails the check |
 
 ### agent.py (port 8001)
 
+Same auth requirement as above; each protected endpoint verifies the token itself and forwards it to memory_api.py.
+
 | Method | Endpoint | Description |
 |---|---|---|
+| POST | `/auth/register` | Proxies to memory_api.py |
+| POST | `/auth/login` | Proxies to memory_api.py |
 | POST | `/chat` | Full memory-injected chat turn — returns the reply immediately; `memories_stored` is always `[]` and `extraction_pending: true` signals extraction/storage is running in the background |
-| GET | `/chat/memories/{user_id}` | Memory panel data for frontend |
-| DELETE | `/forget/{user_id}` | Proxies to memory_api.py's smart forget |
+| GET | `/chat/memories` | Memory panel data for frontend |
+| DELETE | `/forget` | Proxies to memory_api.py's smart forget |
 | GET | `/health` | Health check |
 
 ---
@@ -206,21 +225,23 @@ python seed_memories.py
 
 Open `http://localhost:8001/app` after starting `agent.py`.
 
+- **Login / Register screen** — shown whenever no valid token is stored; toggles between the two modes. The token is kept in `localStorage` and attached to every request as `Authorization: Bearer <token>`; a `401` response logs the session out automatically.
 - **Chat panel** — standard chat, with badges showing how many memories were recalled and whether the turn was stored
 - **Memory panel** — live view of all stored memories, sorted by importance score, with color-coded TTL bars
-- **🧹 Smart Forget button** — manually triggers a review of expired memories for the current user via `DELETE /forget/{user_id}`, and shows the reviewed/deleted/kept counts inline
-- **New Session** — starts a fresh session ID while keeping all memories intact (tests cross-session recall)
+- **🧹 Smart Forget button** — manually triggers a review of expired memories for the logged-in user via `DELETE /forget`, and shows the reviewed/deleted/kept counts inline
+- **New Session** — starts a fresh session ID while keeping all memories intact (tests cross-session recall); unrelated to login — it doesn't sign you out
 - **Clear Chat** — wipes the UI conversation history, memory unaffected
 - **🗑 per-card delete** — remove individual memories
-- **✕ Clear All** — nuke all memories for the current user ID
+- **✕ Clear All** — nuke all memories for the logged-in user
+- **Logout** — clears the stored token and returns to the login screen
 - **"How this works" intro panel** — shown on first load, walks new users/judges through what the app does and a step-by-step script to test cross-session recall in under a minute. Dismissible via the close button, reopenable via the header link.
 
 ---
 
 ## Cross-Session Recall Demo
 
-1. Start a session, tell the agent your name, your project, your preferences
-2. Click **New Session** (or restart the server entirely)
+1. Register a new account (any username/password), tell the agent your name, your project, your preferences
+2. Click **New Session** (or restart the server entirely) — this does *not* log you out
 3. Ask the agent something related — it will recall and reference what you told it
 4. The memory panel shows which memories were injected into that response
 
@@ -238,7 +259,7 @@ python test_memory_agent.py
 python test_memory_agent.py --remote <ECS-public-IP>
 ```
 
-Covers: health checks, store/recall, importance scoring calibration (including the specific-vs-vague and name-floor rules above), deduplication and conflict arbitration, negative-fact filtering, cross-session recall, smart forget, manual delete, and a structural validation pass over `frontend/index.html` (catches regressions like a hardcoded `API_BASE` or a leaked default user ID before they reach a live deployment).
+Registers a fresh test account first (`POST /auth/register`, via agent.py's proxy) and authenticates every subsequent call with the returned token. Covers: health checks, store/recall, importance scoring calibration (including the specific-vs-vague and name-floor rules above), deduplication and conflict arbitration, negative-fact filtering, cross-session recall, smart forget, manual delete, and a structural validation pass over `frontend/index.html` (catches regressions like a hardcoded `API_BASE`, a leaked default credential in the login form, or an authenticated call that bypasses the `authFetch()` wrapper before they reach a live deployment).
 
 ---
 

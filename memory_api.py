@@ -10,11 +10,14 @@ import logging
 import json
 import uuid
 import asyncio
+import bcrypt
+import jwt
 from typing import List, Optional
 from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
@@ -27,6 +30,13 @@ load_dotenv()
 QWEN_API_KEY = os.getenv("QWEN_API_KEY")
 QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    raise RuntimeError("JWT_SECRET environment variable is required")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "24"))
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:8001").split(",")
 
 try:
     import asyncpg
@@ -51,7 +61,7 @@ app = FastAPI(title="MemoryAgent Vector Core", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -97,6 +107,18 @@ class DatabaseManager:
                     CREATE INDEX IF NOT EXISTS idx_memories_embedding
                         ON memories USING hnsw (embedding vector_cosine_ops);
                 """)
+                # No FK to memories.user_id on purpose — that column stays a plain
+                # string (now always the authenticated username) rather than being
+                # migrated to reference this table, so the existing HNSW-indexed
+                # memories table needs no migration at all for auth to land.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        username VARCHAR(100) UNIQUE NOT NULL,
+                        password_hash VARCHAR(255) NOT NULL,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                """)
                 logger.info("[DB] Table structure verified.")
         except Exception as e:
             logger.critical(f"[DB] Initialization Error: {e}")
@@ -126,7 +148,6 @@ async def shutdown():
     await db.close()
 
 class MemoryCreate(BaseModel):
-    user_id: str
     session_id: str
     content: str
     metadata: dict = Field(default_factory=dict)
@@ -143,13 +164,25 @@ class MemoryResponse(BaseModel):
     metadata: dict
 
 class RecallRequest(BaseModel):
-    user_id: str
     query: str
     top_k: int = 5
 
 class RecallResponse(BaseModel):
     context_window: str
     memories: List[dict]
+
+class UserCreate(BaseModel):
+    username: str = Field(min_length=3, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$")
+    password: str = Field(min_length=8, max_length=72)
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    username: str
 
 
 @app.get("/health")
@@ -170,6 +203,93 @@ async def health():
             redis_status = "unreachable"
 
     return {"status": "healthy", "redis": redis_status}
+
+
+# ── auth ─────────────────────────────────────────────────────────────────────
+
+bearer_scheme = HTTPBearer(auto_error=False)
+# auto_error=False is deliberate: HTTPBearer's default raises 403 on a missing
+# Authorization header (only a present-but-malformed one gets to a 401 from
+# our own check below). We want a consistent 401 for "not authenticated"
+# either way, so we check for None ourselves instead of relying on the default.
+
+
+def _hash_password_sync(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+
+def _verify_password_sync(password: str, password_hash: str) -> bool:
+    return bcrypt.checkpw(password.encode(), password_hash.encode())
+
+
+async def hash_password(password: str) -> str:
+    # bcrypt is a synchronous, CPU-bound call (~100-300ms) — running it directly
+    # inside an async endpoint would block the whole event loop for that long,
+    # stalling every other in-flight request (recall, chat, etc.) meanwhile.
+    return await asyncio.to_thread(_hash_password_sync, password)
+
+
+async def verify_password(password: str, password_hash: str) -> bool:
+    return await asyncio.to_thread(_verify_password_sync, password, password_hash)
+
+
+def create_access_token(username: str) -> str:
+    payload = {
+        "sub": username,
+        "iat": datetime.now(timezone.utc),
+        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+async def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+) -> str:
+    """FastAPI dependency — the sole source of truth for identity on every
+    memory-scoped endpoint below. There is no longer a client-supplied user_id
+    anywhere in these requests; it's always derived from a verified token."""
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    username = payload.get("sub")
+    if not username:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+    return username
+
+
+@app.post("/auth/register", response_model=TokenResponse)
+async def register(user: UserCreate):
+    # Normalized to lowercase so username uniqueness/lookup isn't case-sensitive
+    # (Postgres VARCHAR UNIQUE is case-sensitive by default) — matters for
+    # continuity with pre-existing demo data seeded under lowercase user_ids.
+    username = user.username.lower()
+    password_hash = await hash_password(user.password)
+    async with db.pool.acquire() as conn:
+        try:
+            await conn.execute(
+                "INSERT INTO users (username, password_hash) VALUES ($1, $2)",
+                username, password_hash,
+            )
+        except asyncpg.UniqueViolationError:
+            raise HTTPException(status_code=409, detail="Username already taken")
+    return TokenResponse(access_token=create_access_token(username), username=username)
+
+
+@app.post("/auth/login", response_model=TokenResponse)
+async def login(user: UserLogin):
+    username = user.username.lower()
+    async with db.pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT password_hash FROM users WHERE username = $1", username)
+    # Same generic message whether the username doesn't exist or the password is
+    # wrong, so a login attempt can't be used to enumerate registered usernames.
+    if row is None or not await verify_password(user.password, row["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    return TokenResponse(access_token=create_access_token(username), username=username)
 
 
 async def safe_redis_call(coro, action: str):
@@ -292,7 +412,7 @@ Return ONLY 'UPDATE' or 'NEW'."""
 
 
 @app.post("/memory", response_model=MemoryResponse)
-async def store_memory(entry: MemoryCreate):
+async def store_memory(entry: MemoryCreate, user_id: str = Depends(get_current_user)):
     """Store a memory — Qwen scores importance + generates embedding. Skips duplicates cleanly."""
     try:
         embedding = await get_embedding(entry.content)
@@ -306,9 +426,9 @@ async def store_memory(entry: MemoryCreate):
                 # duplicate/contradictory row before this one commits. Scoped to
                 # user_id (not the whole table) so unrelated users never contend
                 # on this lock. Released automatically when the transaction ends.
-                await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", entry.user_id)
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", user_id)
 
-                status = await manage_duplicates_and_conflicts(conn, entry.content, entry.user_id, embedding)
+                status = await manage_duplicates_and_conflicts(conn, entry.content, user_id, embedding)
 
                 if status == "SKIP":
                     logger.info(f"Rejecting redundant memory: {entry.content[:60]}")
@@ -340,7 +460,7 @@ async def store_memory(entry: MemoryCreate):
                         VALUES ($1, $2, $3, $4::vector, $5, $6, $7)
                         RETURNING *
                     """,
-                    entry.user_id,
+                    user_id,
                     entry.session_id,
                     entry.content,
                     embedding_str,
@@ -378,7 +498,7 @@ async def store_memory(entry: MemoryCreate):
 
 
 @app.post("/recall", response_model=RecallResponse)
-async def recall_memories(request: RecallRequest):
+async def recall_memories(request: RecallRequest, user_id: str = Depends(get_current_user)):
     """Retrieve chronologically weighted and semantically close memories isolated strictly by user_id."""
     try:
         embedding = await get_embedding(request.query)
@@ -393,7 +513,7 @@ async def recall_memories(request: RecallRequest):
                 AND (expires_at IS NULL OR expires_at > NOW())
                 ORDER BY importance_score DESC, (1 - (embedding <=> $1::vector)) DESC
                 LIMIT $3
-            """, embedding_str, request.user_id, request.top_k)
+            """, embedding_str, user_id, request.top_k)
 
         memories_output = []
         context_blocks = []
@@ -418,7 +538,6 @@ async def recall_memories(request: RecallRequest):
 
 
 class ForgetRequest(BaseModel):
-    user_id: str
     batch_size: int = 20
 
 
@@ -459,7 +578,7 @@ Reply with exactly one word: DELETE or KEEP."""
 
 
 @app.delete("/forget", response_model=ForgetResponse)
-async def smart_forget(request: ForgetRequest):
+async def smart_forget(request: ForgetRequest, user_id: str = Depends(get_current_user)):
     """
     Smart forgetting — reviews memories that are already past their expires_at TTL
     and asks Qwen to make a final keep/delete call on each, rather than blind TTL deletion.
@@ -474,7 +593,7 @@ async def smart_forget(request: ForgetRequest):
               AND expires_at <= NOW()
             ORDER BY expires_at ASC
             LIMIT $2
-        """, request.user_id, request.batch_size)
+        """, user_id, request.batch_size)
 
     # The review calls are the slow part — one Qwen round-trip per candidate,
     # up to batch_size of them. Run them concurrently instead of serially, capped
@@ -521,9 +640,9 @@ async def smart_forget(request: ForgetRequest):
     )
 
 
-@app.get("/memories/{user_id}")
-async def list_user_memories(user_id: str, limit: int = 30):
-    """Exposes all active memory schemas bound to a specific user context."""
+@app.get("/memories")
+async def list_user_memories(limit: int = 30, user_id: str = Depends(get_current_user)):
+    """Exposes all active memory schemas bound to the authenticated user."""
     async with db.pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT id, content, importance_score, created_at, expires_at, metadata
@@ -547,12 +666,17 @@ async def list_user_memories(user_id: str, limit: int = 30):
 
 
 @app.delete("/memory/{memory_id}")
-async def delete_single_memory(memory_id: str):
-    """Remove a specific targeted fact vector across storage partitions."""
+async def delete_single_memory(memory_id: str, user_id: str = Depends(get_current_user)):
+    """Remove a specific targeted fact vector — scoped to rows the authenticated
+    user actually owns. A memory_id that exists but belongs to someone else and
+    a memory_id that doesn't exist at all both fall into the same 404 below,
+    so this never confirms whether an ID exists for another user."""
     try:
         target_uuid = uuid.UUID(memory_id)
         async with db.pool.acquire() as conn:
-            res = await conn.execute("DELETE FROM memories WHERE id = $1", target_uuid)
+            res = await conn.execute(
+                "DELETE FROM memories WHERE id = $1 AND user_id = $2", target_uuid, user_id
+            )
             if "DELETE 0" in res:
                 raise HTTPException(status_code=404, detail="Memory key not found.")
         if db.redis:
@@ -562,9 +686,9 @@ async def delete_single_memory(memory_id: str):
         raise HTTPException(status_code=400, detail="Invalid UUID token string format.")
 
 
-@app.delete("/memories/{user_id}")
-async def flush_user_vault(user_id: str):
-    """Full hard drop of every data vector entry assigned to a single clean context user partition."""
+@app.delete("/memories")
+async def flush_user_vault(user_id: str = Depends(get_current_user)):
+    """Full hard drop of every memory belonging to the authenticated user."""
     async with db.pool.acquire() as conn:
         await conn.execute("DELETE FROM memories WHERE user_id = $1", user_id)
     return {"status": "cleared", "user_id": user_id}

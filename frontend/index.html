@@ -344,6 +344,69 @@
   ::-webkit-scrollbar { width: 4px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: #2a2a3a; border-radius: 2px; }
+  #appShell {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .auth-screen {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    align-items: center;
+    justify-content: center;
+  }
+  .auth-card {
+    background: #12121a;
+    border: 1px solid #1e1e2e;
+    border-radius: 10px;
+    padding: 28px 26px;
+    width: 280px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .auth-card h2 {
+    font-size: 15px;
+    color: #a78bfa;
+    text-align: center;
+    margin-bottom: 4px;
+  }
+  .auth-card input {
+    background: #1e1e2e;
+    border: 1px solid #2a2a3a;
+    border-radius: 6px;
+    padding: 9px 12px;
+    color: #e8e8f0;
+    font-size: 13px;
+  }
+  .auth-card input:focus { outline: none; border-color: #7c3aed; }
+  .auth-error {
+    font-size: 11.5px;
+    color: #f87171;
+    min-height: 14px;
+    text-align: center;
+  }
+  .auth-toggle {
+    font-size: 12px;
+    color: #6b6b8a;
+    text-align: center;
+    margin-top: 4px;
+  }
+  .auth-toggle-btn {
+    background: none;
+    border: none;
+    color: #a78bfa;
+    font-size: 12px;
+    cursor: pointer;
+    text-decoration: underline;
+    padding: 0;
+    margin-left: 4px;
+  }
+  .logged-in-as { font-size: 12px; color: #6b6b8a; }
+  .logged-in-as strong { color: #e8e8f0; }
 </style>
 </head>
 <body>
@@ -365,7 +428,7 @@
 
   <div class="intro-section-title">Try this in under a minute</div>
   <ol>
-    <li>Type a name into the <strong>User ID</strong> field above (e.g. <code>judge1</code>) and press Tab — this gives you a clean, isolated identity with no prior history.</li>
+    <li>Register a new account below (any username/password works — e.g. <code>judge1</code>) — this gives you a clean, isolated identity with no prior history.</li>
     <li>Tell it a few facts about yourself in one message, e.g. <em>"My name is Alex, I'm a backend engineer, and I'm allergic to peanuts."</em></li>
     <li>Click <strong>New Session</strong> (top bar) — this clears the visible chat, simulating a brand-new conversation.</li>
     <li>Ask: <em>"What do you know about me?"</em> — it will recall what you said, even with zero visible chat history. That recall is the whole point.</li>
@@ -387,17 +450,33 @@
 
   <div class="intro-section-title">Notes for evaluation</div>
   <p>
-    Memory is isolated per User ID — different IDs never see each other's data. This is a hackathon
-    demo build: the User ID field is a simple text input rather than real authentication, by design,
-    to make testing fast. Source, architecture diagrams, and deployment details are in the GitHub repo.
+    Memory is isolated per account — registering with a different username creates a completely
+    separate identity with no access to anyone else's data. Passwords are hashed (bcrypt) and every
+    request is verified with a JWT, not a client-supplied identity string. Source, architecture
+    diagrams, and deployment details are in the GitHub repo.
   </p>
 </div>
 
+<div class="auth-screen" id="authScreen">
+  <div class="auth-card">
+    <h2 id="authTitle">Log In</h2>
+    <input type="text" id="authUsername" placeholder="Username" autocomplete="username" />
+    <input type="password" id="authPassword" placeholder="Password" autocomplete="current-password" />
+    <button class="send-btn" id="authSubmitBtn" onclick="submitAuth()">Log In</button>
+    <div class="auth-error" id="authError"></div>
+    <div class="auth-toggle">
+      <span id="authToggleText">Need an account?</span>
+      <button class="auth-toggle-btn" id="authToggleBtn" onclick="toggleAuthMode()">Register</button>
+    </div>
+  </div>
+</div>
+
+<div id="appShell" style="display:none;">
 <div class="user-bar">
-  <label>User ID</label>
-  <input type="text" id="userId" placeholder="e.g. judge1, demo, your-name" value="" />
+  <span class="logged-in-as">Logged in as <strong id="usernameDisplay"></strong></span>
   <button class="refresh-btn" onclick="newSession()">New Session</button>
   <button class="refresh-btn" onclick="clearHistory()">Clear Chat</button>
+  <button class="refresh-btn" onclick="logout()">Logout</button>
   <span class="session-id" id="sessionLabel">session: —</span>
 </div>
 <div class="main">
@@ -415,7 +494,7 @@
       <button class="send-btn" id="sendBtn" onclick="sendMessage()">Send</button>
     </div>
   </div>
-  
+
   <div class="memory-panel">
     <div class="memory-header">
       <h2>Stored Memories</h2>
@@ -430,6 +509,7 @@
     </div>
     <div class="forget-status" id="forgetStatus"></div>
   </div>
+</div>
 </div>
 
 <script>
@@ -482,6 +562,103 @@
   }
   checkHealth();
 
+  // ── auth ──────────────────────────────────────────────────────────────────
+
+  const TOKEN_KEY = 'memoryagent_token';
+  const USERNAME_KEY = 'memoryagent_username';
+  let authToken = localStorage.getItem(TOKEN_KEY) || null;
+  let currentUsername = localStorage.getItem(USERNAME_KEY) || null;
+  let authMode = 'login';
+
+  function showAuthScreen() {
+    document.getElementById('authScreen').style.display = 'flex';
+    document.getElementById('appShell').style.display = 'none';
+  }
+
+  function showApp() {
+    document.getElementById('authScreen').style.display = 'none';
+    document.getElementById('appShell').style.display = 'flex';
+    document.getElementById('usernameDisplay').textContent = currentUsername || '';
+  }
+
+  function toggleAuthMode() {
+    authMode = authMode === 'login' ? 'register' : 'login';
+    const isLogin = authMode === 'login';
+    document.getElementById('authTitle').textContent = isLogin ? 'Log In' : 'Register';
+    document.getElementById('authSubmitBtn').textContent = isLogin ? 'Log In' : 'Register';
+    document.getElementById('authToggleText').textContent = isLogin ? 'Need an account?' : 'Already have one?';
+    document.getElementById('authToggleBtn').textContent = isLogin ? 'Register' : 'Log In';
+    document.getElementById('authError').textContent = '';
+  }
+
+  async function submitAuth() {
+    const username = document.getElementById('authUsername').value.trim();
+    const password = document.getElementById('authPassword').value;
+    const errorEl = document.getElementById('authError');
+    errorEl.textContent = '';
+    if (!username || !password) {
+      errorEl.textContent = 'Enter a username and password.';
+      return;
+    }
+    const endpoint = authMode === 'login' ? '/auth/login' : '/auth/register';
+    try {
+      const resp = await fetch(`${API_BASE}${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        errorEl.textContent = data.detail || `${authMode === 'login' ? 'Login' : 'Registration'} failed.`;
+        return;
+      }
+      authToken = data.access_token;
+      currentUsername = data.username;
+      localStorage.setItem(TOKEN_KEY, authToken);
+      localStorage.setItem(USERNAME_KEY, currentUsername);
+      document.getElementById('authUsername').value = '';
+      document.getElementById('authPassword').value = '';
+      showApp();
+      loadMemories();
+    } catch (err) {
+      errorEl.textContent = `Connection error: ${err.message}`;
+    }
+  }
+
+  function logout() {
+    authToken = null;
+    currentUsername = null;
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(USERNAME_KEY);
+    lastStoredId = null;
+    conversationHistory = [];
+    document.getElementById('messages').innerHTML = `
+      <div class="message assistant">
+        <div class="bubble">Hi! I'm your memory-enabled assistant. I'll remember what you tell me — even across sessions. What's on your mind?</div>
+      </div>`;
+    showAuthScreen();
+  }
+
+  // Wraps fetch() with the Authorization header, and logs out automatically on
+  // a 401 (missing/expired/invalid token) instead of leaving the UI silently
+  // failing against every subsequent call with a stale token.
+  async function authFetch(path, opts = {}) {
+    const headers = { ...(opts.headers || {}), 'Authorization': `Bearer ${authToken}` };
+    const resp = await fetch(`${API_BASE}${path}`, { ...opts, headers });
+    if (resp.status === 401) {
+      logout();
+      throw new Error('Session expired — please log in again.');
+    }
+    return resp;
+  }
+
+  if (authToken) {
+    showApp();
+    loadMemories();
+  } else {
+    showAuthScreen();
+  }
+
   function hideIntro() {
     document.getElementById('introPanel').classList.add('hidden');
     document.getElementById('showIntroBtn').style.display = 'inline-block';
@@ -531,11 +708,10 @@
   // duplicate or a negative-fact turn legitimately produces nothing new)
   // and just does a final plain refresh instead.
   async function pollForNewMemory(knownIds, attempts = 8, intervalMs = 750) {
-    const userId = document.getElementById('userId').value.trim() || 'default_user';
     for (let i = 0; i < attempts; i++) {
       await new Promise(r => setTimeout(r, intervalMs));
       try {
-        const resp = await fetch(`${API_BASE}/chat/memories/${encodeURIComponent(userId)}?limit=30`);
+        const resp = await authFetch('/chat/memories?limit=30');
         if (!resp.ok) continue;
         const data = await resp.json();
         const list = Array.isArray(data) ? data : data.memories || [];
@@ -557,7 +733,6 @@
     const msg = input.value.trim();
     if (!msg) return;
 
-    const userId = document.getElementById('userId').value.trim() || 'default_user';
     const knownIds = currentMemoryIds();
 
     appendMessage('user', msg);
@@ -566,11 +741,10 @@
     setLoading(true);
 
     try {
-      const resp = await fetch(`${API_BASE}/chat`, {
+      const resp = await authFetch('/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          user_id: userId,
           session_id: sessionId,
           message: msg,
           conversation_history: conversationHistory,
@@ -628,9 +802,8 @@
   }
 
   async function loadMemories() {
-    const userId = document.getElementById('userId').value.trim() || 'default_user';
     try {
-      const resp = await fetch(`${API_BASE}/chat/memories/${encodeURIComponent(userId)}?limit=30`);
+      const resp = await authFetch('/chat/memories?limit=30');
       if (!resp.ok) return;
       const data = await resp.json();
       
@@ -671,20 +844,6 @@
     }).join('');
   }
 
-  document.getElementById('userId').addEventListener('change', () => {
-    sessionId = generateUUID();
-    document.getElementById('sessionLabel').textContent = `session: ${sessionId.slice(0, 8)}…`;
-    conversationHistory = [];
-    lastStoredId = null;
-    document.getElementById('messages').innerHTML = `
-      <div class="message assistant">
-        <div class="bubble">Switched to a new user — chat cleared. Loading this user's stored memories…</div>
-      </div>`;
-    loadMemories();
-  });
-
-  loadMemories();
-
   document.getElementById('input').addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -699,7 +858,7 @@
 
   async function deleteMemory(memoryId) {
     try {
-      const resp = await fetch(`${API_BASE}/memory/${memoryId}`, { method: 'DELETE' });
+      const resp = await authFetch(`/memory/${memoryId}`, { method: 'DELETE' });
       if (resp.ok) loadMemories();
     } catch (err) {
       console.error('Delete failed:', err);
@@ -707,12 +866,11 @@
   }
 
   async function smartForget() {
-    const userId = document.getElementById('userId').value.trim() || 'default_user';
     const statusEl = document.getElementById('forgetStatus');
     statusEl.textContent = 'Reviewing expired memories…';
     statusEl.className = 'forget-status visible';
     try {
-      const resp = await fetch(`${API_BASE}/forget/${encodeURIComponent(userId)}?batch_size=20`, { method: 'DELETE' });
+      const resp = await authFetch('/forget?batch_size=20', { method: 'DELETE' });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
       const { reviewed = 0, deleted = 0, kept = 0 } = data;
@@ -729,10 +887,9 @@
   }
 
   async function clearAllMemories() {
-    const userId = document.getElementById('userId').value.trim() || 'default_user';
-    if (!confirm(`Delete ALL memories for "${userId}"? This cannot be undone.`)) return;
+    if (!confirm(`Delete ALL memories for "${currentUsername}"? This cannot be undone.`)) return;
     try {
-      const resp = await fetch(`${API_BASE}/memories/${encodeURIComponent(userId)}`, { method: 'DELETE' });
+      const resp = await authFetch('/memories', { method: 'DELETE' });
       if (resp.ok) {
         lastStoredId = null;
         loadMemories();
