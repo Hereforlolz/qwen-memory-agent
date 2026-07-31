@@ -39,7 +39,13 @@ except ImportError:
     aioredis = None
     REDIS_URL = None
 
-qwen = AsyncOpenAI(api_key=QWEN_API_KEY, base_url=QWEN_BASE_URL)
+# Explicit timeout instead of the SDK default (~600s) — nothing in this file
+# bounds how long a hung Qwen call is allowed to run otherwise. store_memory
+# holds a connection and a per-user advisory lock (pg_advisory_xact_lock)
+# across the conflict-arbitration call AND the importance-scoring call, so an
+# unbounded hang in either one would hold that connection/lock unbounded too
+# — blocking any other write for the same user for as long as the hang lasts.
+qwen = AsyncOpenAI(api_key=QWEN_API_KEY, base_url=QWEN_BASE_URL, timeout=20.0)
 app = FastAPI(title="MemoryAgent Vector Core", version="1.0.0")
 
 app.add_middleware(
