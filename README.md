@@ -118,7 +118,7 @@ qwen-memory-agent/
 ├── seed_memories.py     # Test data seeder
 ├── test_memory_agent.py # End-to-end test suite (API + frontend file validation)
 ├── frontend/
-│   └── index.html       # Chat UI + live memory panel + intro/how-to-use guide
+│   └── index.html       # Login/register + chat UI + live memory panel + intro/how-to-use guide
 ├── .env.example
 ├── requirements.txt
 └── README.md
@@ -216,6 +216,8 @@ Same auth requirement as above; each protected endpoint verifies the token itsel
 | POST | `/auth/login` | Proxies to memory_api.py |
 | POST | `/chat` | Full memory-injected chat turn — returns the reply immediately; `memories_stored` is always `[]` and `extraction_pending: true` signals extraction/storage is running in the background |
 | GET | `/chat/memories` | Memory panel data for frontend |
+| DELETE | `/memory/{memory_id}` | Proxies to memory_api.py — delete a single memory |
+| DELETE | `/memories` | Proxies to memory_api.py — delete all of the authenticated user's memories |
 | DELETE | `/forget` | Proxies to memory_api.py's smart forget |
 | GET | `/health` | Health check |
 
@@ -259,7 +261,7 @@ python test_memory_agent.py
 python test_memory_agent.py --remote <ECS-public-IP>
 ```
 
-Registers a fresh test account first (`POST /auth/register`, via agent.py's proxy) and authenticates every subsequent call with the returned token. Covers: health checks, store/recall, importance scoring calibration (including the specific-vs-vague and name-floor rules above), deduplication and conflict arbitration, negative-fact filtering, cross-session recall, smart forget, manual delete, and a structural validation pass over `frontend/index.html` (catches regressions like a hardcoded `API_BASE`, a leaked default credential in the login form, or an authenticated call that bypasses the `authFetch()` wrapper before they reach a live deployment).
+Registers a fresh test account first (`POST /auth/register`, via agent.py's proxy) and authenticates every subsequent call with the returned token. Covers: health checks, store/recall, importance scoring calibration (including the specific-vs-vague and name-floor rules above), deduplication and conflict arbitration, negative-fact filtering, cross-session recall, smart forget, manual delete, and a structural validation pass over `frontend/index.html` (catches regressions like a hardcoded `API_BASE`, a leaked default credential in the login form, an authenticated call that bypasses the `authFetch()` wrapper, or a dynamic value interpolated back into an inline `onclick` handler — before any of them reach a live deployment).
 
 ---
 
