@@ -73,14 +73,18 @@ sequenceDiagram
     A->>Q: chat completion<br/>(system prompt + memory context + history)
     Q-->>A: assistant reply
 
+    A-->>U: {reply, memories_used,<br/>memories_stored: [], extraction_pending: true}
+
+    rect rgba(124, 58, 237, 0.08)
+    Note over A,R: Background task, fired after the reply above —<br/>not awaited by /chat, so the user isn't kept waiting on it
     A->>Q: extract structured memories<br/>(excludes negative/absence facts)
     Q-->>A: JSON array of facts
 
-    loop for each extracted memory (max 3)
+    loop for each extracted memory (max 3, fired concurrently)
         A->>M: POST /memory {content}
         M->>Q: embed(content)
         Q-->>M: embedding vector
-        M->>N: rank candidates by<br/>60% similarity + 40% importance
+        M->>N: acquire per-user advisory lock,<br/>rank candidates by<br/>60% similarity + 40% importance
         N-->>M: top-3 candidates
 
         alt similarity > 0.96 or exact match
@@ -104,8 +108,7 @@ sequenceDiagram
             M->>R: cache memory (1hr TTL)
         end
     end
-
-    A-->>U: {reply, memories_used,<br/>memories_stored, context_injected}
+    end
 ```
 
 ## Memory Lifecycle
@@ -145,7 +148,7 @@ flowchart LR
 | Component | Responsibility |
 |---|---|
 | **frontend/index.html** | Chat UI, live memory panel, session management, delete controls |
-| **agent.py** | Orchestrates chat turns: recall → prompt assembly → Qwen call → memory extraction → storage. Proxies delete requests. |
+| **agent.py** | Orchestrates chat turns: recall → prompt assembly → Qwen call, returning the reply immediately; memory extraction → storage runs afterward as a background task. Proxies delete requests. |
 | **memory_api.py** | Owns all memory intelligence: importance scoring, embedding generation, semantic recall, context synthesis, deduplication, smart forgetting, CRUD |
 | **Qwen Cloud (qwen-plus)** | Chat completions for: user-facing replies, importance scoring, context synthesis, memory extraction |
 | **Qwen Cloud (text-embedding-v3)** | 1024-dimension embeddings for semantic search and duplicate detection |
@@ -164,6 +167,8 @@ flowchart LR
 
 **Deduplication and conflict resolution at write time** — rather than blind dedup, candidate memories are ranked by a blended similarity+importance score and Qwen arbitrates whether a close match should be treated as a duplicate (reject), an update (overwrite the stale fact), or a genuinely new independent memory. This handles the common case where a user's stated preference changes over time ("I prefer Python" → "actually I've switched to Rust") without leaving stale, contradictory memories in the store.
 
+**Extraction and storage run after the reply, not before it** — `agent.py`'s `/chat` used to block on the full embed/dedup/arbitrate/score chain for every extracted fact before responding, even though none of that work is needed to answer the user. `chat_turn` now returns the reply as soon as Qwen produces it; extraction and storage run afterward as a background task (`extract_and_store`). `POST /chat` reflects this in its response shape: `memories_stored` is always `[]` and `extraction_pending: true` signals the work is still in flight — the memory panel picks up newly stored facts on its next refresh rather than from the chat response itself.
+
 **Memory content is framed as data, never instructions** — because stored memories get re-injected into the system prompt of *future*, unrelated sessions, a malicious message stored as a "memory" could otherwise act as a persistent, cross-session jailbreak. The recall system prompt, the extraction prompt, and the conflict-arbitration prompt all explicitly tell Qwen that memory/user content is untrusted data to read, never instructions to obey — including text that impersonates system or admin commands. This is prompt-level defense-in-depth: it meaningfully reduces injection risk but, like any LLM-based defense, isn't a hard guarantee against a sufficiently adversarial input.
 
 ## Known Limitations
@@ -177,3 +182,5 @@ These are deliberate scope decisions for a hackathon timeline, not oversights �
 **Importance scoring is a single LLM call per memory, not a learned model.** It's fast to build and genuinely effective (see the calibration rules above), but it means scoring is only as consistent as Qwen's adherence to the prompt — occasional miscalibration is possible and was in fact found and corrected once during testing (see the specific-vs-vague and name-floor rules).
 
 **Smart Forget runs synchronously per request, not on a schedule.** It only reviews memories when `/forget` is explicitly called (via the UI button or API), not automatically in the background. A production system would likely run this as a periodic job instead of a manual trigger.
+
+**Background extraction has no durability.** `extract_and_store` runs as a fire-and-forget `asyncio.Task`, not a persisted job in a queue. A graceful shutdown (FastAPI's shutdown hook, or the CLI loop exiting) drains any in-flight tasks before the process exits, so a normal restart doesn't lose work — but a hard crash or kill between the reply being sent and that task completing loses that turn's extraction silently, with nothing recorded that it was ever attempted. A production version would push extraction onto a durable queue instead of an in-process task.
