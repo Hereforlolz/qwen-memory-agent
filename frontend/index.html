@@ -513,12 +513,52 @@
       </div>`;
   }
 
+  // Ids currently rendered in the memory panel — used as the "before" snapshot
+  // for pollForNewMemory below, since the backend no longer tells us the new
+  // memory's id directly (see agent.py's extraction_pending).
+  function currentMemoryIds() {
+    return new Set(
+      Array.from(document.querySelectorAll('.memory-card'))
+        .map(el => el.id.replace(/^card-/, ''))
+    );
+  }
+
+  // agent.py now returns the chat reply immediately and runs extraction +
+  // storage as a background task, so memories_stored on the /chat response
+  // is always empty — there's no id to read off it anymore. Poll the memory
+  // list instead, comparing against the ids we already had, and highlight
+  // whichever one is genuinely new. Gives up after a few tries (e.g. a
+  // duplicate or a negative-fact turn legitimately produces nothing new)
+  // and just does a final plain refresh instead.
+  async function pollForNewMemory(knownIds, attempts = 8, intervalMs = 750) {
+    const userId = document.getElementById('userId').value.trim() || 'default_user';
+    for (let i = 0; i < attempts; i++) {
+      await new Promise(r => setTimeout(r, intervalMs));
+      try {
+        const resp = await fetch(`${API_BASE}/chat/memories/${encodeURIComponent(userId)}?limit=30`);
+        if (!resp.ok) continue;
+        const data = await resp.json();
+        const list = Array.isArray(data) ? data : data.memories || [];
+        const newOne = list.find(m => !knownIds.has(m.id));
+        if (newOne) {
+          lastStoredId = newOne.id;
+          renderMemories(list);
+          return;
+        }
+      } catch (err) {
+        console.error('Poll for new memory failed:', err);
+      }
+    }
+    loadMemories();
+  }
+
   async function sendMessage() {
     const input = document.getElementById('input');
     const msg = input.value.trim();
     if (!msg) return;
 
     const userId = document.getElementById('userId').value.trim() || 'default_user';
+    const knownIds = currentMemoryIds();
 
     appendMessage('user', msg);
     input.value = '';
@@ -549,12 +589,7 @@
       conversationHistory.push({ role: 'user', content: msg });
       conversationHistory.push({ role: 'assistant', content: data.reply });
 
-      // Track the latest stored memory ID if returned in the new plural array array layout
-      if (data.memories_stored && data.memories_stored.length > 0) {
-         lastStoredId = data.memories_stored[0].id;
-      }
-
-      setTimeout(loadMemories, 800);
+      pollForNewMemory(knownIds);
     } catch (err) {
       appendMessage('assistant', `⚠️ Error: ${err.message}. Check that agent.py is running on port 8001.`);
     } finally {

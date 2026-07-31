@@ -34,7 +34,7 @@ The result: an agent that gets more useful over time, not less.
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                    agent.py  (port 8001)                     │
-│  POST /chat        → recall → Qwen chat → extract → store   │
+│ POST /chat → recall → Qwen reply → bg extract/store          │
 │  GET  /chat/memories/{user_id}                               │
 └──────────┬──────────────────────────────┬───────────────────┘
            │ HTTP                          │ OpenAI-compat SDK
@@ -97,7 +97,7 @@ The scoring prompt is explicitly calibrated against two failure modes found duri
 
 **Structured context retrieval** — recalled memories aren't dumped into the prompt as raw rows; they're formatted into a clean, dated bullet list ordered by importance and relevance before being injected into the system prompt.
 
-**Smart extraction** — after each turn, a second Qwen call extracts structured facts from the conversation (up to 3 per turn) rather than storing raw message text.
+**Smart extraction** — after each turn, a second Qwen call extracts structured facts from the conversation (up to 3 per turn) rather than storing raw message text. This runs as a background task *after* the chat reply is already sent, not before it — the user isn't kept waiting on memory_api.py's embed/dedup/arbitrate/score chain for facts that aren't needed to answer them. `POST /chat` returns `extraction_pending: true` and an empty `memories_stored` accordingly; the memory panel picks up newly stored facts on its next refresh rather than from the chat response itself.
 
 **Smart forget** — memories with `expires_at` in the past (low/medium importance only — permanent memories with `expires_at = NULL` are never touched) are batch-reviewed via `DELETE /forget`. For each candidate, Qwen weighs the content, its original importance score, and its age, then votes `DELETE` or `KEEP`. Deleted memories are hard-removed from Neon and purged from the Redis cache; kept memories get their TTL renewed by 7 days rather than being re-flagged every cycle.
 
@@ -195,7 +195,7 @@ python seed_memories.py
 
 | Method | Endpoint | Description |
 |---|---|---|
-| POST | `/chat` | Full memory-injected chat turn — returns `memories_stored: list[dict]` |
+| POST | `/chat` | Full memory-injected chat turn — returns the reply immediately; `memories_stored` is always `[]` and `extraction_pending: true` signals extraction/storage is running in the background |
 | GET | `/chat/memories/{user_id}` | Memory panel data for frontend |
 | DELETE | `/forget/{user_id}` | Proxies to memory_api.py's smart forget |
 | GET | `/health` | Health check |
