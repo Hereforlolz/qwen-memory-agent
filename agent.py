@@ -207,7 +207,7 @@ Return only a JSON array of strings. Example: ["Nidhi is working on Qwen MemoryA
         try:
             memories_list = json.loads(extracted_text)
             if isinstance(memories_list, list):
-                for mem in memories_list[:5]:
+                for mem in memories_list[:3]:
                     save_res = await store_memory(
                         user_id,
                         session_id,
