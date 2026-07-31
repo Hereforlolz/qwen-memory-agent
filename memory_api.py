@@ -9,6 +9,7 @@ import os
 import logging
 import json
 import uuid
+import asyncio
 from typing import List, Optional
 from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel, Field
@@ -475,13 +476,25 @@ async def smart_forget(request: ForgetRequest):
             LIMIT $2
         """, request.user_id, request.batch_size)
 
+    # The review calls are the slow part — one Qwen round-trip per candidate,
+    # up to batch_size of them. Run them concurrently instead of serially, capped
+    # by a semaphore so a large batch_size can't fire dozens of simultaneous
+    # requests at the Qwen API at once. The DB/Redis side effects below stay
+    # sequential since they're fast and each touches an independent row.
+    review_semaphore = asyncio.Semaphore(5)
+
+    async def review(row):
+        async with review_semaphore:
+            return await qwen_should_forget(
+                row['content'], float(row['importance_score']), row['created_at']
+            )
+
+    verdicts = await asyncio.gather(*[review(row) for row in candidates])
+
     deleted_ids: List[str] = []
     kept = 0
 
-    for row in candidates:
-        should_delete = await qwen_should_forget(
-            row['content'], float(row['importance_score']), row['created_at']
-        )
+    for row, should_delete in zip(candidates, verdicts):
         if should_delete:
             async with db.pool.acquire() as conn:
                 await conn.execute("DELETE FROM memories WHERE id = $1", row['id'])
