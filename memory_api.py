@@ -80,6 +80,16 @@ class DatabaseManager:
                     );
                     CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id);
                 """)
+                # Without this, every recall and every dedup candidate lookup does an
+                # exact sequential scan of the user's rows, computing cosine distance
+                # against each one — fine at hackathon scale, but it's the first thing
+                # to degrade as memory counts grow. HNSW (not IVFFlat) because it builds
+                # incrementally and needs no row-count-dependent tuning, so it's correct
+                # to create unconditionally at startup even against an empty table.
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_memories_embedding
+                        ON memories USING hnsw (embedding vector_cosine_ops);
+                """)
                 logger.info("[DB] Table structure verified.")
         except Exception as e:
             logger.critical(f"[DB] Initialization Error: {e}")
