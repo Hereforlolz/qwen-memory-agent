@@ -137,12 +137,33 @@ class RecallResponse(BaseModel):
 
 @app.get("/health")
 async def health():
-    """Basic liveness check — confirms DB pool and Redis are reachable."""
+    """Basic liveness check — confirms the DB pool is reachable. Redis is a
+    best-effort cache with no functional dependents, so its reachability is
+    reported but never fails the check."""
     async with db.pool.acquire() as conn:
         await conn.fetchval("SELECT 1")
+
+    redis_status = "disabled"
     if db.redis:
-        await db.redis.ping()
-    return {"status": "healthy"}
+        try:
+            await db.redis.ping()
+            redis_status = "ok"
+        except Exception as e:
+            logger.warning(f"[Redis] Health ping failed: {e}")
+            redis_status = "unreachable"
+
+    return {"status": "healthy", "redis": redis_status}
+
+
+async def safe_redis_call(coro, action: str):
+    """Best-effort Redis write. Redis here is a cache with no functional
+    dependents — a hiccup must never fail a request whose Postgres write
+    already succeeded, so failures are logged and swallowed rather than
+    propagated."""
+    try:
+        await coro
+    except Exception as e:
+        logger.warning(f"[Redis] {action} failed, continuing without cache: {e}")
 
 
 async def get_embedding(text: str) -> List[float]:
@@ -279,7 +300,7 @@ async def store_memory(entry: MemoryCreate):
                     RETURNING *
                 """, entry.content, embedding_str, importance, expires_at, entry.session_id, uuid.UUID(status))
                 if db.redis:
-                    await db.redis.delete(f"memory:{status}")
+                    await safe_redis_call(db.redis.delete(f"memory:{status}"), "cache invalidation")
             else:
                 row = await conn.fetchrow("""
                     INSERT INTO memories
@@ -297,10 +318,13 @@ async def store_memory(entry: MemoryCreate):
                 )
 
         if db.redis and row:
-            await db.redis.setex(
-                f"memory:{row['id']}",
-                3600,
-                json.dumps({"content": entry.content, "importance": importance})
+            await safe_redis_call(
+                db.redis.setex(
+                    f"memory:{row['id']}",
+                    3600,
+                    json.dumps({"content": entry.content, "importance": importance})
+                ),
+                "cache write"
             )
 
         return MemoryResponse(
@@ -431,7 +455,7 @@ async def smart_forget(request: ForgetRequest):
             async with db.pool.acquire() as conn:
                 await conn.execute("DELETE FROM memories WHERE id = $1", row['id'])
             if db.redis:
-                await db.redis.delete(f"memory:{row['id']}")
+                await safe_redis_call(db.redis.delete(f"memory:{row['id']}"), "cache invalidation")
             deleted_ids.append(str(row['id']))
             logger.info(f"[Smart Forget] Deleted expired memory {row['id']}: {row['content'][:60]}")
         else:
@@ -488,7 +512,7 @@ async def delete_single_memory(memory_id: str):
             if "DELETE 0" in res:
                 raise HTTPException(status_code=404, detail="Memory key not found.")
         if db.redis:
-            await db.redis.delete(f"memory:{memory_id}")
+            await safe_redis_call(db.redis.delete(f"memory:{memory_id}"), "cache invalidation")
         return {"status": "deleted", "id": memory_id}
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid UUID token string format.")
