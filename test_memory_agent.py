@@ -605,6 +605,23 @@ def test_frontend_file():
         "authScreen + submitAuth/logout/toggleAuthMode all found" if has_auth_ui else "auth UI or its JS functions are missing"
     )
 
+    # --- regression 10: no dynamic value interpolated into an inline onclick attribute ---
+    # This broke for real once: the per-memory delete button used to be built as
+    # onclick="deleteMemory('${m.id}')" via innerHTML. Since m.id was always a
+    # server-generated UUID it never actually broke in production, but a real
+    # browser test (Playwright) confirmed the pattern itself was exploitable — an id
+    # containing a single quote closes the JS string literal early inside the
+    # attribute, corrupting or hijacking the handler. Fixed by moving to a
+    # data-id attribute read through a delegated event listener instead, which
+    # never parses the value as code regardless of its content. This check makes
+    # sure that fix doesn't quietly get reverted by a future edit.
+    interpolated_onclick = re.findall(r'onclick="[^"]*\$\{', content)
+    check(
+        "no dynamic value interpolated directly into an inline onclick attribute",
+        len(interpolated_onclick) == 0,
+        "no interpolated onclick attributes found" if not interpolated_onclick else f"found {len(interpolated_onclick)}: {interpolated_onclick}"
+    )
+
 
 # ── runner ────────────────────────────────────────────────────────────────────
 

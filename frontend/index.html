@@ -798,7 +798,7 @@
   }
 
   function escapeHtml(t) {
-    return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
   }
 
   async function loadMemories() {
@@ -830,9 +830,9 @@
       const expires = m.expires_at ? `expires ${new Date(m.expires_at).toLocaleDateString()}` : 'permanent';
       const created = m.created_at ? new Date(m.created_at).toLocaleString([], { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' }) : '';
       return `
-        <div class="memory-card ${isFresh ? 'fresh' : ''}" id="card-${m.id}">
+        <div class="memory-card ${isFresh ? 'fresh' : ''}" id="card-${escapeHtml(m.id)}">
           <div class="memory-content">
-            <button class="delete-btn" onclick="deleteMemory('${m.id}')" title="Delete this memory">🗑</button>
+            <button class="delete-btn" data-id="${escapeHtml(m.id)}" title="Delete this memory">🗑</button>
             ${escapeHtml(content)}
           </div>
           <div class="memory-score-bar">
@@ -843,6 +843,17 @@
         </div>`;
     }).join('');
   }
+
+  // Delegated instead of an inline onclick built via string interpolation into
+  // innerHTML — m.id is always a server-generated UUID today, but interpolating
+  // any value into an HTML attribute that gets parsed as a JS event handler is a
+  // fragile pattern in general (it stops being safe the moment anyone reuses it
+  // for a less-trusted field). Reading data-id through the DOM instead means the
+  // value never passes through HTML/JS parsing as code, regardless of content.
+  document.getElementById('memoryList').addEventListener('click', e => {
+    const btn = e.target.closest('.delete-btn');
+    if (btn) deleteMemory(btn.dataset.id);
+  });
 
   document.getElementById('input').addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) {
