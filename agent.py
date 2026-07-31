@@ -28,6 +28,15 @@ MEMORY_API_URL = os.getenv("MEMORY_API_URL", "http://localhost:8000")
 
 qwen = AsyncOpenAI(api_key=QWEN_API_KEY, base_url=QWEN_BASE_URL)
 
+# Shared across all memory_api.py calls instead of opening a new client (and
+# a new TCP/TLS connection) per request — a single chat turn alone can make
+# several of these calls. Constructing an AsyncClient doesn't touch the
+# network or require a running event loop, so this is safe at import time
+# and works for both the FastAPI server and the CLI loop, which never fires
+# FastAPI's startup event. Closed in the FastAPI shutdown hook below; the
+# CLI path just lets the process exit, which is fine for a short-lived run.
+http_client = httpx.AsyncClient()
+
 app = FastAPI(title="MemoryAgent Chat", version="1.0.0")
 
 app.add_middleware(
@@ -37,23 +46,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.on_event("shutdown")
+async def shutdown():
+    await http_client.aclose()
+
+
 # ── memory API calls ──────────────────────────────────────────────────────────
 
 async def recall_context(user_id: str, query: str) -> tuple[str, list[dict]]:
     """Returns (context_window string, raw memories list)"""
-    async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            resp = await client.post(
-                f"{MEMORY_API_URL}/recall",
-                json={"user_id": user_id, "query": query, "top_k": 10},
-            )
-            if resp.status_code != 200:
-                return "", []
-            data = resp.json()
-            return data.get("context_window", ""), data.get("memories", [])
-        except Exception as e:
-            print(f"[ERROR] Recall communication failed: {e}")
+    try:
+        resp = await http_client.post(
+            f"{MEMORY_API_URL}/recall",
+            json={"user_id": user_id, "query": query, "top_k": 10},
+            timeout=15,
+        )
+        if resp.status_code != 200:
             return "", []
+        data = resp.json()
+        return data.get("context_window", ""), data.get("memories", [])
+    except Exception as e:
+        print(f"[ERROR] Recall communication failed: {e}")
+        return "", []
 
 
 async def store_memory(user_id: str, session_id: str, content: str, metadata: dict = None) -> dict:
@@ -61,45 +76,45 @@ async def store_memory(user_id: str, session_id: str, content: str, metadata: di
     if metadata is None:
         metadata = {"source": "chat_agent"}
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            resp = await client.post(
-                f"{MEMORY_API_URL}/memory",
-                json={
-                    "user_id": user_id,
-                    "session_id": session_id,
-                    "content": content,
-                    "metadata": metadata,
-                },
-            )
-            if resp.status_code == 200:
-                return resp.json()
-            elif resp.status_code == 409:
-                print(f"[INFO] Duplicate skipped: {content[:60]}")
-                return {"status": "duplicate", "skipped": True}
-            else:
-                print(f"[WARN] Store failed: {resp.status_code}")
-                return {}
-        except Exception as e:
-            print(f"[ERROR] Store memory failed: {e}")
+    try:
+        resp = await http_client.post(
+            f"{MEMORY_API_URL}/memory",
+            json={
+                "user_id": user_id,
+                "session_id": session_id,
+                "content": content,
+                "metadata": metadata,
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        elif resp.status_code == 409:
+            print(f"[INFO] Duplicate skipped: {content[:60]}")
+            return {"status": "duplicate", "skipped": True}
+        else:
+            print(f"[WARN] Store failed: {resp.status_code}")
             return {}
+    except Exception as e:
+        print(f"[ERROR] Store memory failed: {e}")
+        return {}
 
 
 async def list_memories(user_id: str, limit: int = 20) -> list[dict]:
     """API returns a plain list"""
-    async with httpx.AsyncClient(timeout=10) as client:
-        try:
-            resp = await client.get(
-                f"{MEMORY_API_URL}/memories/{user_id}",
-                params={"limit": limit},
-            )
-            if resp.status_code != 200:
-                return []
-            data = resp.json()
-            return data if isinstance(data, list) else []
-        except Exception as e:
-            print(f"[ERROR] List memories failed: {e}")
+    try:
+        resp = await http_client.get(
+            f"{MEMORY_API_URL}/memories/{user_id}",
+            params={"limit": limit},
+            timeout=10,
+        )
+        if resp.status_code != 200:
             return []
+        data = resp.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"[ERROR] List memories failed: {e}")
+        return []
 
 
 # ── core chat turn ────────────────────────────────────────────────────────────
@@ -287,37 +302,35 @@ async def health():
 
 @app.delete("/memory/{memory_id}")
 async def delete_memory_proxy(memory_id: str):
-    async with httpx.AsyncClient(timeout=10) as client:
-        try:
-            resp = await client.delete(f"{MEMORY_API_URL}/memory/{memory_id}")
-            if resp.status_code == 404:
-                raise HTTPException(status_code=404, detail="Memory not found")
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail="Memory service error")
+    try:
+        resp = await http_client.delete(f"{MEMORY_API_URL}/memory/{memory_id}", timeout=10)
+        if resp.status_code == 404:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        return resp.json()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail="Memory service error")
 
 
 @app.delete("/memories/{user_id}")
 async def delete_all_memories_proxy(user_id: str):
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.delete(f"{MEMORY_API_URL}/memories/{user_id}")
-        return resp.json()
+    resp = await http_client.delete(f"{MEMORY_API_URL}/memories/{user_id}", timeout=10)
+    return resp.json()
 
 
 @app.delete("/forget/{user_id}")
 async def smart_forget_proxy(user_id: str, batch_size: int = 20):
     """Proxies to memory_api.py's Qwen-arbitrated smart forget for expired, low-importance memories."""
-    async with httpx.AsyncClient(timeout=30) as client:
-        try:
-            resp = await client.request(
-                "DELETE",
-                f"{MEMORY_API_URL}/forget",
-                json={"user_id": user_id, "batch_size": batch_size},
-            )
-            return resp.json()
-        except Exception as e:
-            print(f"[ERROR] Smart forget proxy failed: {e}")
-            raise HTTPException(status_code=502, detail="Smart forget service unreachable")
+    try:
+        resp = await http_client.request(
+            "DELETE",
+            f"{MEMORY_API_URL}/forget",
+            json={"user_id": user_id, "batch_size": batch_size},
+            timeout=30,
+        )
+        return resp.json()
+    except Exception as e:
+        print(f"[ERROR] Smart forget proxy failed: {e}")
+        raise HTTPException(status_code=502, detail="Smart forget service unreachable")
 
 
 # ── serve frontend ────────────────────────────────────────────────────────────

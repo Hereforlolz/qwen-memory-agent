@@ -189,7 +189,7 @@ python seed_memories.py
 | DELETE | `/memory/{memory_id}` | Hard delete a single memory |
 | DELETE | `/memories/{user_id}` | Delete all memories for a user |
 | DELETE | `/forget` | Qwen-arbitrated smart forget — reviews expired, low-importance memories and deletes or renews each (body: `{user_id, batch_size}`) |
-| GET | `/health` | Health check (DB + Redis ping) |
+| GET | `/health` | Health check — DB must be reachable; Redis is reported (`redis: "ok"/"unreachable"/"disabled"`) but never fails the check |
 
 ### agent.py (port 8001)
 
