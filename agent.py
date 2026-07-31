@@ -207,13 +207,21 @@ Return only a JSON array of strings. Example: ["Nidhi is working on Qwen MemoryA
         try:
             memories_list = json.loads(extracted_text)
             if isinstance(memories_list, list):
-                for mem in memories_list[:3]:
-                    save_res = await store_memory(
+                # Fire the stores concurrently instead of one at a time. Each
+                # still serializes somewhat on memory_api.py's per-user advisory
+                # lock once it reaches the actual write, but the embedding call
+                # that precedes that lock (and the queueing itself) now overlaps
+                # across all three instead of running fully back-to-back.
+                save_results = await asyncio.gather(*[
+                    store_memory(
                         user_id,
                         session_id,
                         str(mem),
                         metadata={"source": "chat_agent", "type": "extracted"}
                     )
+                    for mem in memories_list[:3]
+                ])
+                for save_res in save_results:
                     if save_res and "id" in save_res:
                         stored_pipeline_results.append(save_res)
         except Exception:
