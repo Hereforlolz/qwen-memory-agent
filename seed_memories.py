@@ -9,5 +9,10 @@ memories = [
 
 for m in memories:
     r = requests.post("http://localhost:8000/memory", json=m)
-    data = r.json()
-    print(f"stored: [{data['importance_score']}] {m['content'][:50]}")
+    if r.status_code == 200:
+        data = r.json()
+        print(f"stored: [{data['importance_score']}] {m['content'][:50]}")
+    elif r.status_code == 409:
+        print(f"skipped (already seeded): {m['content'][:50]}")
+    else:
+        print(f"failed ({r.status_code}): {m['content'][:50]}")

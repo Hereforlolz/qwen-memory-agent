@@ -76,6 +76,44 @@ def safe_request(method, url, **kwargs):
         return _FailedResponse()
 
 
+def poll_until(fetch_fn, predicate=bool, timeout=8.0, interval=0.5):
+    """Calls fetch_fn() repeatedly until predicate(result) is true or timeout
+    elapses, returning whatever the last call produced either way.
+
+    Replaces a fixed time.sleep(N) before a single read-after-write check.
+    A blind sleep either wastes time when the system is fast, or isn't long
+    enough when it's slow (e.g. under real Qwen latency variance) — this
+    returns as soon as the expected state shows up, and still gives the full
+    timeout as headroom when it doesn't.
+    """
+    deadline = time.time() + timeout
+    result = fetch_fn()
+    while not predicate(result) and time.time() < deadline:
+        time.sleep(interval)
+        result = fetch_fn()
+    return result
+
+
+def poll_until_stable(fetch_fn, timeout=8.0, interval=0.5):
+    """Calls fetch_fn() repeatedly until two consecutive calls return an
+    equal value, meaning no further async writes appear to be landing.
+
+    Used instead of poll_until when we're checking for the *absence* of
+    something (e.g. negative-fact filtering) — there's no positive condition
+    to wait for, so we wait for the pipeline to visibly stop changing before
+    taking the snapshot we actually check.
+    """
+    deadline = time.time() + timeout
+    previous = fetch_fn()
+    while time.time() < deadline:
+        time.sleep(interval)
+        current = fetch_fn()
+        if current == previous:
+            return current
+        previous = current
+    return previous
+
+
 # ── 1. Health checks ─────────────────────────────────────────────────────────
 
 def test_health():
@@ -118,18 +156,26 @@ def test_basic_store_and_recall():
     else:
         memory_id = None
 
-    time.sleep(1)  # let it settle
+    def do_recall():
+        return safe_request("POST", f"{BASE_MEMORY}/recall", json={
+            "user_id": TEST_USER,
+            "query": "what programming language do I like",
+            "top_k": 5,
+        }, timeout=15)
 
-    r = safe_request("POST", f"{BASE_MEMORY}/recall", json={
-        "user_id": TEST_USER,
-        "query": "what programming language do I like",
-        "top_k": 5,
-    }, timeout=15)
+    def found_rust(resp):
+        return resp.status_code == 200 and any(
+            "rust" in m["content"].lower() for m in resp.json().get("memories", [])
+        )
+
+    # Poll instead of a blind sleep — the store above already returned 200,
+    # so this resolves immediately in the common case, but keeps retrying up
+    # to the timeout if recall lags behind the write for any reason.
+    r = poll_until(do_recall, found_rust)
     check("POST /recall returns 200", r.status_code == 200, f"got {r.status_code}")
     if r.status_code == 200:
         data = r.json()
-        found = any("rust" in m["content"].lower() for m in data.get("memories", []))
-        check("recall finds the Rust fact via semantic search", found, str(data.get("memories")))
+        check("recall finds the Rust fact via semantic search", found_rust(r), str(data.get("memories")))
         check("context_window is non-empty", len(data.get("context_window", "")) > 0)
 
     return memory_id
@@ -233,7 +279,16 @@ def test_dedup_and_conflicts():
             f"original_id={original_id}, new_id={new_id}"
         )
 
-    time.sleep(1)
+    # Poll until the memory list stops changing instead of a blind sleep,
+    # so the duplicate count below is taken from a settled snapshot.
+    def snapshot_ids():
+        r = safe_request("GET", f"{BASE_MEMORY}/memories/{TEST_USER}", timeout=15)
+        if r.status_code != 200:
+            return None
+        return tuple(sorted(m["id"] for m in r.json()))
+
+    poll_until_stable(snapshot_ids)
+
     r4 = safe_request("GET", f"{BASE_MEMORY}/memories/{TEST_USER}", timeout=15)
     if r4.status_code == 200:
         contents = [m["content"].lower() for m in r4.json()]
@@ -267,7 +322,17 @@ def test_negative_fact_filtering():
     }, timeout=30)
     check("chat turn with negative facts completes", r.status_code == 200, f"got {r.status_code}")
 
-    time.sleep(2)
+    # We're checking for the *absence* of something, so there's no positive
+    # condition to poll for — instead wait for the memory list to stop
+    # changing (no more async writes landing) before taking the snapshot.
+    def snapshot_ids():
+        r = safe_request("GET", f"{BASE_MEMORY}/memories/{TEST_USER}", timeout=15)
+        if r.status_code != 200:
+            return None
+        return tuple(sorted(m["id"] for m in r.json()))
+
+    poll_until_stable(snapshot_ids)
+
     r2 = safe_request("GET", f"{BASE_MEMORY}/memories/{TEST_USER}", timeout=15)
     if r2.status_code == 200:
         contents = [m["content"].lower() for m in r2.json()]
@@ -294,7 +359,19 @@ def test_cross_session_recall():
     }, timeout=30)
     check("session A: chat turn completes", r1.status_code == 200, f"got {r1.status_code}")
 
-    time.sleep(3)  # allow extraction pipeline to finish writing memories
+    # Poll the memory store directly (a read, not another chat turn — so
+    # retries don't burn extra Qwen chat calls) until the deadline fact from
+    # session A is actually visible. /chat only returns after storage
+    # completes today, so this resolves immediately in practice, but it
+    # keeps the test honest instead of hardcoding how long that takes.
+    def deadline_landed():
+        r = safe_request("GET", f"{BASE_MEMORY}/memories/{TEST_USER}", timeout=15)
+        if r.status_code != 200:
+            return False
+        contents = " ".join(m["content"].lower() for m in r.json())
+        return "july" in contents or "deadline" in contents
+
+    poll_until(deadline_landed)
 
     r2 = safe_request("POST", f"{BASE_AGENT}/chat", json={
         "user_id": TEST_USER,
@@ -355,7 +432,12 @@ def test_manual_delete(memory_id):
     r2 = safe_request("DELETE", f"{BASE_MEMORY}/memories/{TEST_USER}", timeout=15)
     check("DELETE /memories/{user_id} clears all memories", r2.status_code == 200, f"got {r2.status_code}")
 
-    time.sleep(1)
+    def list_is_empty():
+        r = safe_request("GET", f"{BASE_MEMORY}/memories/{TEST_USER}", timeout=15)
+        return r.status_code == 200 and len(r.json()) == 0
+
+    poll_until(list_is_empty, timeout=5.0)
+
     r3 = safe_request("GET", f"{BASE_MEMORY}/memories/{TEST_USER}", timeout=15)
     if r3.status_code == 200:
         check("memory list is empty after clear-all", len(r3.json()) == 0, f"{len(r3.json())} memories remain")
